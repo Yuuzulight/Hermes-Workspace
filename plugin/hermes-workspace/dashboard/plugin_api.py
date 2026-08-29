@@ -66,7 +66,9 @@ def tree(path: str = "") -> dict:
         raise HTTPException(status_code=404, detail="not a directory")
     vp = hw_store.vault_path()
     dirs, files = [], []
-    for entry in sorted(os.scandir(base), key=lambda e: e.name.lower()):
+    with os.scandir(base) as it:
+        entries = sorted(it, key=lambda e: e.name.lower())
+    for entry in entries:
         if entry.name.startswith("."):
             continue
         rel = os.path.relpath(entry.path, vp).replace(os.sep, "/")
@@ -92,6 +94,9 @@ def note(path: str) -> dict:
 
 @router.get("/resolve")
 def resolve(link: str) -> dict:
+    vp = hw_store.vault_path()
+    if not vp or not vp.is_dir():
+        return {"path": None}
     target = link.strip().strip("[]").split("#")[0].split("|")[0].strip()
     idx = hw_index.get_index()
     hits = idx.search(f'"{target}"', 5)
@@ -108,4 +113,7 @@ class ReindexBody(BaseModel):
 
 @router.post("/reindex")
 def reindex(body: ReindexBody) -> dict:
+    vp = hw_store.vault_path()
+    if not vp or not vp.is_dir():
+        return {"indexed": 0, "removed": 0, "took_ms": 0, "error": "vault_not_found"}
     return hw_index.get_index().sync(full=body.full)
