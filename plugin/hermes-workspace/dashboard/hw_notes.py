@@ -25,21 +25,31 @@ def _flatten_frontmatter(fm: str) -> tuple[str, str, list[str]]:
     pairs: list[str] = []
     tags: list[str] = []
     title_bits: list[str] = []
+    cur_key = ""  # lowercased key of the block being read; "" if secret/none
+
+    def _fold(vals: list[str]) -> None:
+        pairs.extend(vals)
+        if cur_key == "tags":
+            tags.extend(vals)
+        if cur_key in ("title", "aliases"):
+            title_bits.extend(vals)
+
     for line in fm.splitlines():
         m = re.match(r"^([A-Za-z0-9_-]+):\s*(.*)$", line)
         if not m:
             m2 = re.match(r"^\s*-\s+(.*)$", line)
-            if m2 and pairs:
-                pairs.append(m2.group(1).strip())
+            if m2 and cur_key:  # continuation of a kept, non-secret key
+                _fold([v for v in re.split(r"[,\s]+", m2.group(1).strip()) if v])
             continue
         key, val = m.group(1), m.group(2).strip()
         if SECRET_KEY_RE.search(key):
+            cur_key = ""  # drop this line and any "- item" continuations
             continue
-        low = key.lower()
-        values = [v.strip() for v in val.strip("[]").split(",") if v.strip()]
-        if low == "tags":
+        cur_key = key.lower()
+        values = [v for v in re.split(r"[,\s]+", val.strip("[]")) if v]
+        if cur_key == "tags":
             tags += values
-        if low in ("title", "aliases"):
+        if cur_key in ("title", "aliases"):
             title_bits += values
         pairs.append(f"{key} {val}".strip())
     return (
@@ -89,7 +99,7 @@ def _selfcheck() -> None:
                    "Some prose with #inline and #area/health tags.\n"
                    "A [[People/Ada Lovelace|Ada]] link.\n"
                    "```\n#not-a-tag\n```\n", "my-note")
-    assert "my-note" in r["title"] and "My Note" in r["title"], r["title"]
+    assert r["title"] == "my-note My Note MN note two", r["title"]  # no frontmatter leak
     assert "Heading One" in r["headings"]
     assert "inline" in r["tags"].split() and "area/health" in r["tags"].split()
     assert "health" in r["tags"].split()  # nested expansion
@@ -97,6 +107,13 @@ def _selfcheck() -> None:
     assert "ada lovelace" in r["links"]
     assert "sekret" not in r["frontmatter"]  # secret key skipped
     assert "not-a-tag" not in r["tags"].split()  # fenced code ignored
+
+    s = parse_note("---\napi_key:\n  - sekret\n---\nbody\n", "n")  # secret as YAML list
+    assert not any("sekret" in v for v in s.values()), s
+
+    sp = parse_note("---\ntags: red green\naliases: A B\n---\n", "x")  # space-separated lists
+    assert {"red", "green"} <= set(sp["tags"].split()), sp["tags"]
+    assert "A" in sp["title"].split() and "B" in sp["title"].split(), sp["title"]
 
 
 if __name__ == "__main__":
