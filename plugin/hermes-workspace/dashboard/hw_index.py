@@ -269,6 +269,63 @@ def _selfcheck() -> None:
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = saved_home
+    _selfcheck_incremental()
+
+
+def _selfcheck_incremental() -> None:
+    import tempfile
+
+    saved_home = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            hw_store._cache = None
+            vault = os.path.join(d, "vault")
+            os.makedirs(os.path.join(vault, "Topics"))
+            a = os.path.join(vault, "Topics", "A.md")
+            b = os.path.join(vault, "Topics", "B.md")
+            open(a, "w", encoding="utf-8").write("# A\n\napple\n")
+            open(b, "w", encoding="utf-8").write("# B\n\nbanana\n")
+            hw_store.set_vault(vault)
+            reset_for_tests()
+            idx = get_index()
+            idx.sync(full=True)
+
+            calls = []
+            real = hw_notes.parse_note
+            hw_notes.parse_note = lambda t, s: calls.append(s) or real(t, s)
+            try:
+                time.sleep(0.01)
+                open(a, "w", encoding="utf-8").write("# A\n\napricot\n")
+                os.utime(a, None)
+                idx._last_scan_ns = 0
+                idx.sync()
+                assert calls == ["A"], calls  # only the changed file reparsed
+                assert idx.search("apricot", 5)[0]["path"] == "Topics/A.md"
+                assert not idx.search("apple", 5)
+            finally:
+                hw_notes.parse_note = real
+
+            os.remove(b)
+            idx._last_scan_ns = 0
+            idx.sync()
+            assert not idx.search("banana", 5)
+
+            try:
+                os.symlink(a, os.path.join(vault, "Topics", "link.md"))
+                idx._last_scan_ns = 0
+                r = idx.sync()
+                assert not any(x["path"].endswith("link.md") for x in idx.search("apricot", 9))
+            except (OSError, NotImplementedError):
+                # Windows without admin privilege cannot create symlinks
+                pass
+    finally:
+        reset_for_tests()  # close the sqlite handle before temp-dir teardown
+        hw_store._cache = None
+        if saved_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = saved_home
 
 
 if __name__ == "__main__":
