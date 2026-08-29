@@ -169,7 +169,7 @@ class Index:
         try:
             rows = self._con.execute(
                 "SELECT path, title, "
-                "  bm25(notes, 10.0, 4.0, 6.0, 8.0, 2.0, 1.0) AS rank, "
+                "  bm25(notes, 0.0, 10.0, 4.0, 6.0, 8.0, 2.0, 1.0) AS rank, "
                 "  snippet(notes, 6, '<b>', '</b>', ' … ', 12) AS ex "
                 "FROM notes WHERE notes MATCH ? ORDER BY rank LIMIT ?",
                 (q, limit)).fetchall()
@@ -217,11 +217,13 @@ def _selfcheck() -> None:
 
     saved_home = os.environ.get("HERMES_HOME")
     try:
-        with tempfile.TemporaryDirectory() as d:
+        # ignore_cleanup_errors: Windows may not release the sqlite file handle
+        # in the microsecond between reset_for_tests() and rmtree.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             os.environ["HERMES_HOME"] = os.path.join(d, "home")
             hw_store._cache = None
             vault = os.path.join(d, "vault")
-            for sub in ("Areas", "People", ".obsidian"):
+            for sub in ("Areas", "People", "Topics", ".obsidian"):
                 os.makedirs(os.path.join(vault, sub))
             open(os.path.join(vault, "Areas", "Argos.md"), "w",
                  encoding="utf-8").write(
@@ -230,7 +232,13 @@ def _selfcheck() -> None:
             open(os.path.join(vault, "People", "Ada Lovelace.md"), "w",
                  encoding="utf-8").write(
                 "# Ada Lovelace\n\nWrote the first algorithm. See [[Areas/Argos]].\n")
+            # only tie to "argos" is the wikilink target -> exercises the links column
+            open(os.path.join(vault, "Topics", "Linker.md"), "w",
+                 encoding="utf-8").write("See [[Areas/Argos]].\n")
             open(os.path.join(vault, ".obsidian", "app.json"), "w").write("{}")
+            # a .md inside a skipped dir: only excluded if the _walk dir filter runs
+            open(os.path.join(vault, ".obsidian", "notes.md"), "w",
+                 encoding="utf-8").write("# Layout\n\nvault directory layout notes.\n")
             open(os.path.join(vault, "latin1.md"), "wb").write(
                 "# Café\n\nna\xefve bytes.".encode("latin-1"))
             hw_store.set_vault(vault)
@@ -244,15 +252,18 @@ def _selfcheck() -> None:
             assert any(r["path"] == "People/Ada Lovelace.md"
                        for r in idx.search("[[Areas/Argos]]", 5)
                        + idx.search("Argos", 5))
-            assert all(".obsidian" not in r["path"] for r in idx.search("app", 5))
+            assert any(r["path"] == "Topics/Linker.md"
+                       for r in idx.search("Argos", 9))  # matched via links column
+            assert all(".obsidian" not in r["path"]
+                       for r in idx.search("layout", 5))
             assert "<b>" in idx.search("algorithm", 5)[0]["excerpt"]
             idx.search("Café", 5)  # must not raise on the latin-1 note
 
             assert sanitize_fts_query('foo "bar AND baz*') == '"foo" "bar" "AND" "baz*"'
             assert sanitize_fts_query("#roadmap") == "tags:roadmap"
             assert sanitize_fts_query("[[Ada Lovelace]]") == '"Ada" "Lovelace"'
-            reset_for_tests()
     finally:
+        reset_for_tests()  # close the sqlite handle before temp-dir teardown
         hw_store._cache = None
         if saved_home is None:
             os.environ.pop("HERMES_HOME", None)
