@@ -1,4 +1,5 @@
 """Resolve a memory to a vault note, render the line, splice it in, write it safely."""
+import datetime
 import difflib
 import os
 import re
@@ -94,6 +95,135 @@ def _selfcheck() -> None:
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = saved_home
+    _selfcheck_render()
+
+
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_LINE_RE = re.compile(r"^\s*-\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*[—-]\s*(.*)$")
+_HEADING_RE = re.compile(r"^(#{1,6})\s")
+
+
+def _valid_date(s: str, today: str) -> str:
+    if DATE_RE.match(s):
+        try:
+            d = datetime.date.fromisoformat(s)
+            if d <= datetime.date.fromisoformat(today) + datetime.timedelta(days=1):
+                return s
+        except ValueError:
+            pass
+    return today
+
+
+def render_line(history_line: str, supersedes: str | None, today: str) -> str:
+    raw = history_line.strip()
+    m = _LINE_RE.match(raw)
+    if m:
+        date, prose = _valid_date(m.group(1), today), m.group(2).strip()
+    else:
+        date, prose = today, raw.lstrip("-").strip()
+    prose = prose.strip().strip('"').strip()
+    prose = re.sub(r"\s*\*\(supersedes:.*?\)\*\s*$", "", prose).strip()
+    if not prose.endswith((".", "!", "?")):
+        prose += "."
+    line = f"- **{date}** — {prose}"
+    if supersedes:
+        line += f' *(supersedes: "{supersedes.strip().strip(chr(34))}")*'
+    return line
+
+
+def _is_fence(ln: str) -> bool:
+    return ln.startswith("```") or ln.startswith("~~~")
+
+
+def _find_top_level_eof_insert(lines: list[str]) -> int:
+    """Index to insert before, skipping a trailing code fence / callout / --- footer."""
+    inside, f = [], False
+    for ln in lines:
+        if _is_fence(ln):
+            inside.append(True)
+            f = not f
+        else:
+            inside.append(f)
+    i = len(lines)
+    while i > 0 and (lines[i - 1].strip() in ("", "---")
+                     or lines[i - 1].startswith(">") or inside[i - 1]):
+        i -= 1
+    return i
+
+
+def insert_history_line(text: str, line: str) -> tuple[str, bool]:
+    lines = text.splitlines()
+    hist = None
+    for i, ln in enumerate(lines):
+        if _HEADING_RE.match(ln) and ln.split(" ", 1)[1].strip().lower() == "history":
+            hist = i
+            break
+    if hist is None:
+        insert_at = _find_top_level_eof_insert(lines)
+        block = ["", "## History", "", line]
+        lines[insert_at:insert_at] = block
+        return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), True
+
+    end = len(lines)
+    for j in range(hist + 1, len(lines)):
+        if _HEADING_RE.match(lines[j]):
+            end = j
+            break
+    last_bullet = hist
+    for j in range(hist + 1, end):
+        if lines[j].lstrip().startswith(("-", "*")):
+            last_bullet = j
+    lines.insert(last_bullet + 1, line)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), False
+
+
+def insert_timeline_line(text: str, line: str) -> str:
+    lines = text.splitlines()
+    first_bullet = None
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("-"):
+            first_bullet = i
+            break
+    if first_bullet is None:
+        return text.rstrip() + "\n\n" + line + "\n"
+    lines.insert(first_bullet, line)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def new_note_body(stem: str, line: str) -> str:
+    prose = line.split(" — ", 1)[1] if " — " in line else line.lstrip("-").strip()
+    return f"# {stem}\n\n{prose}\n\n## History\n\n{line}\n"
+
+
+def _selfcheck_render() -> None:
+    assert render_line("migrated to X", None, "2026-08-30") == "- **2026-08-30** — migrated to X."
+    assert render_line('- **2026-01-02** — "quoted claim"', None, "2026-08-30") \
+        == "- **2026-01-02** — quoted claim."
+    assert render_line("did a thing", "old thing", "2026-08-30") \
+        == '- **2026-08-30** — did a thing. *(supersedes: "old thing")*'
+    assert render_line("- **2099-01-01** — future", None, "2026-08-30") \
+        .startswith("- **2026-08-30**")  # implausible future date -> today
+    assert "<!--" not in render_line("x", None, "2026-08-30")
+
+    t, created = insert_history_line("# A\n\nprose\n", "- **2026-08-30** — new.")
+    assert created and t.endswith("## History\n\n- **2026-08-30** — new.\n")
+
+    t, created = insert_history_line(
+        "# A\n\np\n\n## History\n\n- **2026-08-01** — old.\n\n## Notes\n\nn\n",
+        "- **2026-08-30** — new.")
+    assert not created
+    assert t.index("- **2026-08-30** — new.") < t.index("## Notes")
+    assert t.index("- **2026-08-01** — old.") < t.index("- **2026-08-30** — new.")
+
+    t, _ = insert_history_line("# A\n\np\n\n```\ncode\n```\n", "- **2026-08-30** — x.")
+    assert t.index("- **2026-08-30** — x.") < t.index("```\ncode")
+
+    tl = insert_timeline_line("# Timeline 2026\n\nintro\n\n- **2026-08-01** — old.\n",
+                              "- **2026-08-30** — new.")
+    assert tl.index("- **2026-08-30** — new.") < tl.index("- **2026-08-01** — old.")
+
+    assert new_note_body("Foo", "- **2026-08-30** — a fact.") == \
+        "# Foo\n\na fact.\n\n## History\n\n- **2026-08-30** — a fact.\n"
 
 
 if __name__ == "__main__":
