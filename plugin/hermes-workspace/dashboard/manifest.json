@@ -1,0 +1,8 @@
+{
+  "name": "hermes-workspace",
+  "label": "Knowledge",
+  "description": "Your Obsidian vault as long-term memory for Hermes.",
+  "icon": "BookMarked",
+  "version": "0.1.0",
+  "api": "plugin_api.py"
+}
