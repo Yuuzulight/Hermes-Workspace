@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fastapi import APIRouter, HTTPException  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
+import hw_context  # noqa: E402
 import hw_index  # noqa: E402
 import hw_store  # noqa: E402
 
@@ -54,6 +55,21 @@ def search(body: SearchBody) -> dict:
     if not vp or not vp.is_dir():
         return {"results": [], "error": "vault_not_found"}
     return {"results": hw_index.get_index().search(body.query, body.limit)}
+
+
+class ContextBody(BaseModel):
+    query: str
+    budget_tokens: int = 1500
+    k_max: int = 6
+
+
+@router.post("/context")
+def context(body: ContextBody) -> dict:
+    vp = hw_store.vault_path()
+    if not vp or not vp.is_dir():
+        return {"notes": [], "total_tokens": 0, "block": ""}
+    return hw_context.build_context(hw_index.get_index(), body.query,
+                                    body.budget_tokens, body.k_max)
 
 
 @router.get("/tree")
