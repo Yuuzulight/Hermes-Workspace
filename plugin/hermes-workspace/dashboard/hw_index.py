@@ -310,12 +310,15 @@ def _selfcheck_incremental() -> None:
             idx._last_scan_ns = 0
             idx.sync()
             assert not idx.search("banana", 5)
+            assert not idx._con.execute("SELECT 1 FROM files WHERE path=?", ("Topics/B.md",)).fetchone()
+            assert not idx._con.execute("SELECT 1 FROM notes WHERE path=?", ("Topics/B.md",)).fetchone()
 
             try:
                 os.symlink(a, os.path.join(vault, "Topics", "link.md"))
                 idx._last_scan_ns = 0
                 r = idx.sync()
                 assert not any(x["path"].endswith("link.md") for x in idx.search("apricot", 9))
+                assert not idx._con.execute("SELECT 1 FROM files WHERE path LIKE ?", ("%link.md",)).fetchone()
             except (OSError, NotImplementedError):
                 # Windows without admin privilege cannot create symlinks
                 pass
