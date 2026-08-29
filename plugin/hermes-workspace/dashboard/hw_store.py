@@ -50,10 +50,10 @@ def get_config() -> dict:
 
 def _write_config(cfg: dict) -> None:
     global _cache
-    _cache = dict(cfg)
     tmp = _config_path().with_suffix(".json.tmp")
     tmp.write_text(json.dumps(cfg, indent=2), "utf-8")
     os.replace(tmp, _config_path())
+    _cache = dict(cfg)
 
 
 def vault_path() -> pathlib.Path | None:
@@ -73,12 +73,17 @@ def guard_path(rel: str) -> pathlib.Path:
     if not vp:
         raise PathError("no vault configured")
     root = vp.resolve()
-    target = (root / rel).resolve()
+    unresolved = root / rel
+    target = unresolved.resolve()
     if not (target == root or root in target.parents):
         raise PathError(f"path escapes vault: {rel}")
-    if target.is_symlink() or (target.exists() and target.parent != root and any(
-        p.is_symlink() for p in target.parents if root in p.parents or p == root)):
-        raise PathError(f"symlinked path refused: {rel}")
+    # .resolve() collapses symlinks, so test them on the unresolved path,
+    # walking every component below the vault root.
+    probe = root
+    for part in unresolved.relative_to(root).parts:
+        probe = probe / part
+        if probe.is_symlink():
+            raise PathError(f"symlinked path refused: {rel}")
     return target
 
 
@@ -94,14 +99,18 @@ def status() -> dict:
     }
 
 
-def set_vault(path: str) -> dict:
+def _validated_vault(path: str) -> str:
     p = pathlib.Path(path)
     if not p.is_dir():
         raise PathError(f"not a directory: {path}")
     if not os.access(p, os.W_OK):
         raise PathError(f"not writable: {path}")
+    return str(p)
+
+
+def set_vault(path: str) -> dict:
     cfg = get_config()
-    cfg["vault"] = str(p)
+    cfg["vault"] = _validated_vault(path)
     _write_config(cfg)
     return status()
 
@@ -112,7 +121,7 @@ def update_config(patch: dict) -> dict:
         if key in patch and patch[key] is not None:
             cfg[key] = patch[key]
     if "vault" in patch and patch["vault"]:
-        return {**set_vault(patch["vault"]), "config": cfg}
+        cfg["vault"] = _validated_vault(patch["vault"])
     _write_config(cfg)
     return {**status(), "config": cfg}
 
@@ -138,6 +147,27 @@ def _selfcheck() -> None:
             except PathError:
                 pass
             assert guard_path("Areas/x.md").name == "x.md"
+
+            real = os.path.join(vault, "real.md")
+            with open(real, "w", encoding="utf-8") as f:
+                f.write("x")
+            try:
+                os.symlink(real, os.path.join(vault, "link.md"))
+            except (OSError, NotImplementedError):
+                pass  # no symlink privilege on this runner
+            else:
+                try:
+                    guard_path("link.md")
+                    raise AssertionError("symlink not refused")
+                except PathError:
+                    pass
+
+            _cache = None
+            out = update_config({"vault": vault, "k": 9})
+            assert out["config"]["k"] == 9, out
+            _cache = None
+            assert get_config()["k"] == 9
+            assert get_config()["vault"] == vault
     finally:
         _cache = None
         if saved_home is None:
