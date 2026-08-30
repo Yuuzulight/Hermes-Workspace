@@ -246,3 +246,142 @@ def _delete_identifier(identifier: str):
     if dir_path.exists():
         import shutil
         shutil.rmtree(dir_path)
+
+
+def _ensure_identifier(identifier: str):
+    """Ensure identifier is sanitized."""
+    return sanitize_identifier(identifier)
+
+
+def create_artifact(
+    identifier: str,
+    type_name: str,
+    language: str | None = None,
+    title: str | None = None,
+    origin: str | None = "agent"
+) -> tuple[str, int]:
+    """
+    Create a new artifact directory and return (dir_path, version_n).
+    
+    Per spec §5.4:
+      - dir is unique per identifier
+      - first write gets n=1
+      - returns the absolute path for subsequent writes
+    """
+    identifier = _ensure_identifier(identifier)
+    if not title:
+        title = f"Artifact {identifier}"
+
+    # Check if already exists (shouldn't happen in normal flow, but be safe)
+    dir_path = _creator_dir() / identifier
+    if dir_path.exists():
+        raise ValueError(f"Identifier '{identifier}' already exists")
+
+    # Create directory with metadata file
+    dir_path.mkdir(parents=True)
+    
+    # Write initial metadata (version 0: schema, no content yet)
+    meta = {
+        "type": type_name,
+        "language": language or "",
+        "title": title,
+        "origin": origin,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+
+    # Write metadata atomically
+    tmp_meta = dir_path / "meta.json.tmp"
+    with open(tmp_meta, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+    tmp_meta.rename(dir_path / "meta.json")
+
+    # Return the directory path and version number 1 (first content write will be n=1)
+    return str(_creator_dir() / identifier), 1
+
+
+def update_artifact(
+    dir_path: str,
+    type_name: str,
+    language: str | None = None,
+    title: str | None = None,
+    origin: str | None = "agent"
+) -> int:
+    """
+    Update artifact metadata. Returns new version number.
+    
+    Per spec §5.4:
+      - Updates meta.json atomically
+      - Increments updated_at timestamp
+    """
+    identifier = Path(dir_path).name
+    
+    # Read current metadata
+    meta_path = _creator_dir() / identifier / "meta.json"
+    if not meta_path.exists():
+        raise ValueError(f"No metadata for '{identifier}'")
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    # Update fields
+    meta["type"] = type_name or meta.get("type")
+    meta["language"] = language or meta.get("language")
+    if title:
+        meta["title"] = title
+    meta["origin"] = origin or meta.get("origin", "agent")
+    meta["updated_at"] = time.time()
+
+    # Write atomically
+    tmp_meta = _creator_dir() / identifier / "meta.json.tmp"
+    with open(tmp_meta, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+    tmp_meta.rename(_creator_dir() / identifier / "meta.json")
+
+    # Return current version number (content versions are separate from metadata updates)
+    return meta.get("version", 1)
+
+
+def read_artifact(dir_path: str) -> dict | None:
+    """
+    Read artifact metadata. Returns dict or None if not found.
+    
+    Per spec §5.4:
+      - Reads meta.json safely
+      - Handles missing/corrupt files gracefully
+    """
+    identifier = Path(dir_path).name
+    
+    meta_path = _creator_dir() / identifier / "meta.json"
+    if not meta_path.exists():
+        return None
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def list_versions(identifier: str) -> list[dict]:
+    """
+    List all versions for an identifier. Returns sorted list of {n, path}.
+    
+    Per spec §5.4:
+      - Only lists .art files matching pattern ^(\d+)\.art$
+      - Sorted by version number ascending
+    """
+    return [_dict_for_version(n, p) for n, p in _list_versions(identifier)]
+
+
+def _dict_for_version(n: int, path: Path) -> dict:
+    """Convert (n, path) tuple to dict format."""
+    return {
+        "n": n,
+        "path": str(path),
+    }
+
+
+def delete_artifact(identifier: str):
+    """Delete all versions for an identifier. Per spec §5.4 cleanup."""
+    _delete_identifier(_ensure_identifier(identifier))
