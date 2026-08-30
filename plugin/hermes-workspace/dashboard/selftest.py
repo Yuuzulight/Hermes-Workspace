@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-MODULES = ["hw_store", "hw_notes", "hw_index", "hw_context", "hw_merge"]  # grows each task
+MODULES = ["hw_store", "hw_notes", "hw_index", "hw_context", "hw_merge", "hw_extract"]  # grows each task
 
 
 def run_module_checks() -> None:
