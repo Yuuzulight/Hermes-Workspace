@@ -68,7 +68,7 @@ def vault_hash() -> str:
     return hashlib.sha1(str(vp.resolve()).encode("utf-8")).hexdigest()[:12]
 
 
-def guard_path(rel: str) -> pathlib.Path:
+def guard_path(rel: str, must_be_file: bool = True) -> pathlib.Path:
     vp = vault_path()
     if not vp:
         raise PathError("no vault configured")
@@ -77,6 +77,8 @@ def guard_path(rel: str) -> pathlib.Path:
     target = unresolved.resolve()
     if not (target == root or root in target.parents):
         raise PathError(f"path escapes vault: {rel}")
+    if must_be_file and (not rel.strip() or target == root):
+        raise PathError("expected a file path inside the vault")
     # .resolve() collapses symlinks, so test them on the unresolved path,
     # walking every component below the vault root.
     probe = root
@@ -85,6 +87,33 @@ def guard_path(rel: str) -> pathlib.Path:
         if probe.is_symlink():
             raise PathError(f"symlinked path refused: {rel}")
     return target
+
+
+def read_rules() -> str:
+    """The vault's capture conventions, first readable of: the configured
+    `rules_file`, `<vault>/agent_rules.md`, the shipped `default_rules.md`."""
+    rf = (get_config().get("rules_file") or "").strip()
+    cands: list[pathlib.Path] = []
+    if rf:
+        p = pathlib.Path(rf)
+        if p.is_absolute():
+            cands.append(p)
+        else:
+            try:
+                cands.append(guard_path(rf))
+            except PathError:
+                pass
+    vp = vault_path()
+    if vp:
+        cands.append(vp / "agent_rules.md")
+    cands.append(pathlib.Path(__file__).with_name("default_rules.md"))
+    for p in cands:
+        try:
+            if p.is_file():
+                return p.read_text("utf-8", errors="replace")
+        except OSError:
+            pass
+    return ""
 
 
 def status() -> dict:
@@ -147,6 +176,21 @@ def _selfcheck() -> None:
             except PathError:
                 pass
             assert guard_path("Areas/x.md").name == "x.md"
+            for bad in ("", "   ", ".", "Areas/.."):  # vault root is not a file target
+                try:
+                    guard_path(bad)
+                    raise AssertionError(f"vault root accepted as a file: {bad!r}")
+                except PathError:
+                    pass
+            assert guard_path("", must_be_file=False) == pathlib.Path(vault).resolve()
+
+            # rules: shipped default when the vault has none, vault file when present
+            rules = read_rules()
+            assert "Vault capture rules" in rules and "## History" in rules, rules[:80]
+            with open(os.path.join(vault, "agent_rules.md"), "w", encoding="utf-8") as f:
+                f.write("# House rules\n\nALWAYS USE FORMAT XYZ\n")
+            assert "ALWAYS USE FORMAT XYZ" in read_rules()
+            os.remove(os.path.join(vault, "agent_rules.md"))
 
             real = os.path.join(vault, "real.md")
             with open(real, "w", encoding="utf-8") as f:

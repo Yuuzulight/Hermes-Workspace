@@ -47,11 +47,16 @@ Rules:
 - Prefer 0-12 items. Return {"memories": []} if nothing qualifies.'''
 
 
-def build_prompt(existing_history: str = "") -> str:
+def build_prompt(existing_history: str = "", rules: str = "") -> str:
+    """PROMPT is the fallback framing; the vault's own rules refine it on top."""
+    out = PROMPT
+    if rules.strip():
+        out += ("\n\n## The vault's capture conventions (follow these exactly)\n"
+                + rules.strip()[:4000])
     if existing_history.strip():
-        return PROMPT + ("\n\nAlready recorded in the vault - do NOT re-emit these:\n"
-                         + existing_history.strip()[:4000])
-    return PROMPT
+        out += ("\n\nAlready recorded in the vault - do NOT re-emit these:\n"
+                + existing_history.strip()[:4000])
+    return out
 
 
 def render_transcript(messages: list[dict]) -> str:
@@ -181,6 +186,12 @@ def _selfcheck() -> None:
 
     assert build_prompt("- **2020-01-01** — old.").endswith("old.")
     assert "do NOT re-emit" in build_prompt("- **2020-01-01** — old.")
+
+    # the vault's own rules are appended; the base taxonomy stays as the framing
+    ruled = build_prompt(rules="ALWAYS USE FORMAT XYZ")
+    assert "ALWAYS USE FORMAT XYZ" in ruled and "capture conventions" in ruled
+    assert "People/<Name>.md" in ruled
+    assert "People/<Name>.md" in build_prompt() and "XYZ" not in build_prompt()
 
 
 if __name__ == "__main__":

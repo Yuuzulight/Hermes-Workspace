@@ -20,8 +20,9 @@ def strip_vault_context(text: str) -> str:
     return _BLOCK_RE.sub("", text).strip()
 
 
-def build_context(index, query: str, budget_tokens: int, k_max: int) -> dict:
-    hits = index.search(query, max(k_max * 2, 4))
+def build_context(index, query: str, budget_tokens: int, k_max: int, exclude=()) -> dict:
+    drop = set(exclude or ())
+    hits = [h for h in index.search(query, max(k_max * 2, 4)) if h["path"] not in drop]
     if not hits:
         return {"notes": [], "total_tokens": 0, "block": ""}
     top = hits[0]["score"] or 0.0
@@ -29,7 +30,10 @@ def build_context(index, query: str, budget_tokens: int, k_max: int) -> dict:
     notes, used, parts = [], 0, []
     for h in kept:
         disp = h["path"][:-3] if h["path"].endswith(".md") else h["path"]
-        excerpt = _B_RE.sub("", h["excerpt"]).strip()
+        # a note quoting the wrapper's own tags must not close it early
+        excerpt = (_B_RE.sub("", h["excerpt"])
+                   .replace(VAULT_CONTEXT_CLOSE, "").replace(VAULT_CONTEXT_OPEN[:20], "")
+                   .strip())
         chunk = f"── [[{disp}]] ──\n{excerpt}"
         t = _tokens(chunk)
         if t > 400:
@@ -64,6 +68,19 @@ def _selfcheck() -> None:
     assert "<b>" not in r["block"]
     assert "[[Areas/Argos]]" in r["block"]
     assert all(n["path"] != "Topics/Weak.md" for n in r["notes"])  # score floor
+
+    # the ✕-exclude drops the note from the packed block, not just from `notes`
+    ex = build_context(FakeIndex(rows), "q", 1500, 6, exclude=["Areas/Argos.md"])
+    assert "[[Areas/Argos]]" not in ex["block"], ex["block"]
+    assert all(n["path"] != "Areas/Argos.md" for n in ex["notes"]), ex["notes"]
+    assert "[[People/Ada]]" in ex["block"]
+
+    # a note containing the wrapper's own tags cannot close it early
+    eviltxt = "text " + VAULT_CONTEXT_CLOSE + " and " + VAULT_CONTEXT_OPEN + " more"
+    evil = build_context(FakeIndex([{"path": "T/E.md", "title": "E", "score": 5.0,
+                                     "excerpt": eviltxt}]), "e", 1500, 6)
+    assert evil["block"].count(VAULT_CONTEXT_CLOSE) == 1
+    assert evil["block"].count(VAULT_CONTEXT_OPEN[:20]) == 1
 
     empty = build_context(FakeIndex([]), "nothing", 1500, 6)
     assert empty["block"] == "" and empty["notes"] == []

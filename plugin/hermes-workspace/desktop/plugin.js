@@ -79,7 +79,11 @@ const withTimeout = (p, ms) =>
 // Shared by the middleware and the preview strip. 1.5s ceiling; excludes applied.
 async function contextFor(query) {
   const res = await withTimeout(
-    api('/context', { method: 'POST', body: { query, budget_tokens: 1500, k_max: 6 } }),
+    api('/context', {
+      method: 'POST',
+      // excludes are applied server-side: the block must match the notes list
+      body: { query, budget_tokens: 1500, k_max: 6, exclude: [...sessionExcludes] },
+    }),
     1500,
   )
   const notes = ((res && res.notes) || []).filter((n) => !sessionExcludes.has(n.path))
@@ -786,18 +790,27 @@ function selectedItems(s) {
 }
 
 async function doPreview(s) {
+  if (approval$.get().busy) return
+  approval$.set({ ...approval$.get(), busy: true })
   try {
     const preview = await api('/memories/preview', {
       method: 'POST',
       body: { items: selectedItems(s), source_session_id: sessionId() },
     })
-    approval$.set({ ...approval$.get(), phase: 'preview', preview })
+    approval$.set({ ...approval$.get(), busy: false, phase: 'preview', preview })
   } catch (e) {
-    approval$.set({ ...approval$.get(), phase: 'error', error: String((e && e.message) || e) })
+    approval$.set({
+      ...approval$.get(),
+      busy: false,
+      phase: 'error',
+      error: String((e && e.message) || e),
+    })
   }
 }
 
 async function doCommit(s) {
+  if (approval$.get().busy) return // a second click must not write twice
+  approval$.set({ ...approval$.get(), busy: true })
   const items = selectedItems(s)
   try {
     const preview =
@@ -816,12 +829,18 @@ async function doCommit(s) {
     const wrote = res.filter((r) => r.status === 'written').length
     approval$.set({
       ...approval$.get(),
+      busy: false,
       phase: 'result',
       result: { items: res, wrote, batch: res[0] && res[0].batch_id },
     })
     host.notify({ kind: 'success', message: `Wrote ${wrote} note(s) to the vault` })
   } catch (e) {
-    approval$.set({ ...approval$.get(), phase: 'error', error: String((e && e.message) || e) })
+    approval$.set({
+      ...approval$.get(),
+      busy: false,
+      phase: 'error',
+      error: String((e && e.message) || e),
+    })
   }
 }
 
@@ -918,8 +937,9 @@ function ApprovalPane() {
           children: [
             jsx(Button, {
               size: 'sm',
+              disabled: !!s.busy,
               onClick: () => doCommit(s),
-              children: `Write ${s.preview.length} note(s)`,
+              children: s.busy ? 'Writing…' : `Write ${s.preview.length} note(s)`,
             }),
             jsx(Button, {
               size: 'sm',
@@ -1072,7 +1092,7 @@ function ApprovalPane() {
         children: [
           jsx(Button, {
             size: 'sm',
-            disabled: !selected.length,
+            disabled: !selected.length || !!s.busy,
             onClick: () => doPreview(s),
             children: `Preview & write (${selected.length} selected)`,
           }),

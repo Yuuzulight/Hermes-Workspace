@@ -2,6 +2,7 @@
 import os
 import re
 import sqlite3
+import threading
 import time
 
 import hw_notes
@@ -53,6 +54,13 @@ class Index:
             self._con.execute("SELECT count(*) FROM notes")  # integrity probe
         except sqlite3.DatabaseError:
             self._con.close()
+            # the -wal/-shm siblings belong to the corrupt db; leaving them
+            # behind lets sqlite reattach them to the fresh one
+            for sfx in ("-wal", "-shm"):
+                try:
+                    self._db_path.with_name(self._db_path.name + sfx).unlink()
+                except OSError:
+                    pass
             self._db_path.rename(
                 self._db_path.with_suffix(f".corrupt-{int(time.time())}"))
             self._con = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -67,6 +75,9 @@ class Index:
         self._meta_set("vault_path", new_vp)
         self._indexing = False
         self._last_scan_ns = 0
+        # one shared connection + a FastAPI threadpool: serialise every writer.
+        # ponytail: one lock per Index; reads stay lock-free (WAL).
+        self._lock = threading.RLock()
 
     def _meta_set(self, k: str, v: str) -> None:
         self._con.execute("INSERT INTO meta(k,v) VALUES(?,?) "
@@ -116,47 +127,51 @@ class Index:
         if not vp or not vp.is_dir():
             return {"indexed": 0, "removed": 0, "took_ms": 0,
                     "error": "vault_not_found"}
-        t0 = time.time()
-        self._indexing = True
-        try:
-            if full:
-                self._con.execute("DELETE FROM notes")
-                self._con.execute("DELETE FROM files")
-            have = {r[0]: (r[1], r[2], r[3]) for r in
-                    self._con.execute("SELECT path,mtime_ns,size,sha1 FROM files")}
-            seen, changed = set(), 0
-            for i, (rel, full_p, st, mb) in enumerate(self._walk()):
-                seen.add(rel)
-                prev = have.get(rel)
-                if prev and prev[0] == st.st_mtime_ns and prev[1] == st.st_size:
-                    continue
-                raw = open(full_p, "rb").read(mb + 1)[:mb]
-                if prev and prev[2] == _sha1(raw):
-                    # stat touched but bytes unchanged — refresh stat, skip reparse
-                    self._con.execute(
-                        "UPDATE files SET mtime_ns=?, size=? WHERE path=?",
-                        (st.st_mtime_ns, st.st_size, rel))
-                    continue
-                self._index_one(rel, full_p, st, raw)
-                changed += 1
-                if i % 500 == 0:
-                    self._con.commit()
-            removed = 0
-            for gone in set(have) - seen:
-                self._con.execute("DELETE FROM notes WHERE path=?", (gone,))
-                self._con.execute("DELETE FROM files WHERE path=?", (gone,))
-                removed += 1
-            self._con.commit()
-            self._last_scan_ns = time.time_ns()
-            self._meta_set("last_scan_ns", str(self._last_scan_ns))
-            return {"indexed": changed, "removed": removed,
-                    "took_ms": int((time.time() - t0) * 1000)}
-        finally:
-            self._indexing = False
+        with self._lock:
+            t0 = time.time()
+            self._indexing = True
+            try:
+                if full:
+                    self._con.execute("DELETE FROM notes")
+                    self._con.execute("DELETE FROM files")
+                have = {r[0]: (r[1], r[2], r[3]) for r in
+                        self._con.execute("SELECT path,mtime_ns,size,sha1 FROM files")}
+                seen, changed = set(), 0
+                for i, (rel, full_p, st, mb) in enumerate(self._walk()):
+                    seen.add(rel)
+                    prev = have.get(rel)
+                    if prev and prev[0] == st.st_mtime_ns and prev[1] == st.st_size:
+                        continue
+                    raw = open(full_p, "rb").read(mb + 1)[:mb]
+                    if prev and prev[2] == _sha1(raw):
+                        # stat touched but bytes unchanged — refresh stat, skip reparse
+                        self._con.execute(
+                            "UPDATE files SET mtime_ns=?, size=? WHERE path=?",
+                            (st.st_mtime_ns, st.st_size, rel))
+                        continue
+                    self._index_one(rel, full_p, st, raw)
+                    changed += 1
+                    if i % 500 == 0:
+                        self._con.commit()
+                removed = 0
+                for gone in set(have) - seen:
+                    self._con.execute("DELETE FROM notes WHERE path=?", (gone,))
+                    self._con.execute("DELETE FROM files WHERE path=?", (gone,))
+                    removed += 1
+                self._con.commit()
+                self._last_scan_ns = time.time_ns()
+                self._meta_set("last_scan_ns", str(self._last_scan_ns))
+                return {"indexed": changed, "removed": removed,
+                        "took_ms": int((time.time() - t0) * 1000)}
+            finally:
+                self._indexing = False
 
     def _maybe_sync(self) -> None:
-        if time.time_ns() - self._last_scan_ns > _DEBOUNCE_NS:
-            self.sync()
+        if time.time_ns() - self._last_scan_ns <= _DEBOUNCE_NS:
+            return
+        with self._lock:  # re-check: the thread that held the lock just synced
+            if time.time_ns() - self._last_scan_ns > _DEBOUNCE_NS:
+                self.sync()
 
     def search(self, query: str, limit: int) -> list[dict]:
         vp = hw_store.vault_path()
@@ -322,6 +337,27 @@ def _selfcheck_incremental() -> None:
             except (OSError, NotImplementedError):
                 # Windows without admin privilege cannot create symlinks
                 pass
+
+            # two threads tripping the debounce at once must not run two syncs
+            # on the one shared connection
+            errs = []
+
+            def _hit():
+                try:
+                    idx._last_scan_ns = 0
+                    idx.sync()
+                except Exception as e:  # noqa: BLE001 - any raise is the failure
+                    errs.append(e)
+
+            ts = [threading.Thread(target=_hit) for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            assert not errs, errs
+            n = idx._con.execute("SELECT count(*) FROM files").fetchone()[0]
+            assert n == 1, n  # only Topics/A.md survives in this vault
+            assert idx.search("apricot", 5)[0]["path"] == "Topics/A.md"
     finally:
         reset_for_tests()  # close the sqlite handle before temp-dir teardown
         hw_store._cache = None

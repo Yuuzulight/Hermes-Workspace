@@ -174,6 +174,40 @@ def _selfcheck_http_write_edges() -> None:
             entry = next(h for h in hist if h["batch_id"] == batch)
             assert entry["counts"] == 2, entry  # item 2 not journaled
 
+            # the pending journal entry was rewritten with the real post-write
+            # facts, and the conflicted item left no trace
+            import hw_merge
+            jitems = hw_merge._read_journal()[-1]["items"]
+            assert len(jitems) == 2, jitems
+            assert all(it["sha_after"] and it["bak"] for it in jitems), jitems
+            assert all(it["path"] == "Areas/A.md" for it in jitems), jitems
+
+            # dedup at commit: a line already in the note is skipped, not written
+            atext_now = open(a, encoding="utf-8").read()
+            dup = c.post("/memories/commit", json={
+                "items": [{"target_path": "Areas/A.md", "history_line": "alpha added.",
+                           "candidate_index": 9}], "source_session_id": "s2"}).json()
+            assert dup[0]["status"] == "skipped" and dup[0]["detail"] == "near_dup", dup
+            assert open(a, encoding="utf-8").read() == atext_now, "skipped item still wrote"
+            assert all(h["batch_id"] != dup[0]["batch_id"]
+                       for h in c.get("/memories/history").json()), "skip was journaled"
+
+            # preview surfaces the same verdict without writing
+            pv = c.post("/memories/preview", json={
+                "items": [{"target_path": "Areas/A.md", "history_line": "alpha added.",
+                           "candidate_index": 9}], "source_session_id": "s2"}).json()
+            assert pv[0]["duplicate"] and pv[0]["reason"] == "near_dup", pv
+            assert "alpha added." in (pv[0]["colliding_line"] or ""), pv
+
+            # Timeline entries carry no supersedes clause (§6.6)
+            tl = c.post("/memories/commit", json={"items": [
+                {"target_path": "Timeline/2026.md", "history_line": "launched the thing.",
+                 "supersedes": "the old claim", "candidate_index": 20}],
+                "source_session_id": "s3"}).json()
+            assert tl[0]["status"] == "written", tl
+            tltext = open(os.path.join(vault, "Timeline", "2026.md"), encoding="utf-8").read()
+            assert "supersedes" not in tltext, tltext
+
             # commit-side guard rejection
             bad = c.post("/memories/commit", json={"items": [
                 {"target_path": "../evil.md", "history_line": "x."}]}).json()
