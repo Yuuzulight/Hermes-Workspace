@@ -1,6 +1,9 @@
 """Hermes Workspace — Knowledge module backend. Wiring only; logic lives in hw_*."""
+import datetime
+import difflib
 import os
 import sys
+import uuid
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -8,7 +11,9 @@ from fastapi import APIRouter, HTTPException  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 import hw_context  # noqa: E402
+import hw_extract  # noqa: E402
 import hw_index  # noqa: E402
+import hw_merge  # noqa: E402
 import hw_store  # noqa: E402
 
 router = APIRouter()
@@ -133,3 +138,167 @@ def reindex(body: ReindexBody) -> dict:
     if not vp or not vp.is_dir():
         return {"indexed": 0, "removed": 0, "took_ms": 0, "error": "vault_not_found"}
     return hw_index.get_index().sync(full=body.full)
+
+
+# --- write side: extraction -> approval -> write ---------------------------
+
+
+class PrepareBody(BaseModel):
+    messages: list[dict]
+
+
+@router.post("/extract/prepare")
+def extract_prepare(body: PrepareBody) -> dict:
+    flat = []
+    for m in body.messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            joined = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+            m = {**m, "content": joined}
+        flat.append(m)
+    return {"transcript_text": hw_extract.render_transcript(flat),
+            "prompt": hw_extract.build_prompt()}
+
+
+class ParseBody(BaseModel):
+    raw: str
+
+
+@router.post("/extract/parse")
+def extract_parse(body: ParseBody) -> dict:
+    return hw_extract.parse_model_output(body.raw)
+
+
+class ResolveBody(BaseModel):
+    candidates: list[dict]
+    source_session_id: str = ""
+
+
+@router.post("/extract/resolve")
+def extract_resolve(body: ResolveBody) -> dict:
+    idx = hw_index.get_index()
+    vp = hw_store.vault_path()
+    today = datetime.date.today().isoformat()
+    out = []
+    for i, c in enumerate(body.candidates):
+        r = hw_merge.resolve_target(c["target"], idx)
+        line = hw_merge.render_line(c["history_line"], c.get("supersedes"), today)
+        tpath = vp / r["target_path"]
+        text = tpath.read_text("utf-8", errors="replace") if tpath.is_file() else ""
+        is_tl = r["target_path"].startswith("Timeline/")
+        dd = hw_merge.dedup_entry(line, text, body.source_session_id, i, idx, is_tl)
+        out.append({**c, "candidate_index": i, "target_path": r["target_path"],
+                    "action": r["action"], "resolved_from": r["resolved_from"],
+                    "fuzzy_candidate": r["fuzzy_candidate"], "rendered_line": line,
+                    "quote": c.get("quote", ""),
+                    "duplicate": dd["duplicate"], "reason": dd["reason"],
+                    "colliding_line": dd["colliding_line"], "warning": dd["warning"]})
+    return {"candidates": out}
+
+
+class MemItem(BaseModel):
+    target_path: str
+    history_line: str
+    supersedes: str | None = None
+    candidate_index: int = 0
+    pre_sha: str | None = None
+
+
+class PreviewBody(BaseModel):
+    items: list[MemItem]
+    source_session_id: str = ""
+
+
+def _plan(item: MemItem):
+    vp = hw_store.vault_path()
+    today = datetime.date.today().isoformat()
+    line = hw_merge.render_line(item.history_line, item.supersedes, today)
+    abspath = vp / item.target_path
+    stem = os.path.splitext(os.path.basename(item.target_path))[0]
+    is_tl = item.target_path.startswith("Timeline/")
+    if abspath.is_file():
+        before = abspath.read_text("utf-8", errors="replace")
+        after = (hw_merge.insert_timeline_line(before, line) if is_tl
+                 else hw_merge.insert_history_line(before, line)[0])
+        action, created = "append", False
+    else:
+        before = ""
+        after = hw_merge.new_note_body(stem, line)
+        action, created = "create", True
+    return line, str(abspath), before, after, action, created
+
+
+@router.post("/memories/preview")
+def memories_preview(body: PreviewBody) -> list[dict]:
+    res = []
+    for item in body.items:
+        try:
+            hw_store.guard_path(item.target_path)
+        except hw_store.PathError:
+            raise HTTPException(status_code=400, detail="invalid path")
+        line, abspath, before, after, action, created = _plan(item)
+        diff = "".join(difflib.unified_diff(
+            before.splitlines(keepends=True), after.splitlines(keepends=True),
+            item.target_path, item.target_path, n=3))
+        pre_sha = hw_merge.sha256(before.encode("utf-8")) if os.path.isfile(abspath) else None
+        res.append({"target_path": item.target_path, "action": action,
+                    "section_created": created, "diff": diff, "pre_sha": pre_sha,
+                    "warnings": [], "resolved_from": ""})
+    return res
+
+
+@router.post("/memories/commit")
+def memories_commit(body: PreviewBody) -> list[dict]:
+    batch_id = uuid.uuid4().hex[:12]
+    journal_items, results, touched = [], [], []
+    backed_up: set[str] = set()
+    for item in body.items:
+        try:
+            hw_store.guard_path(item.target_path)
+        except hw_store.PathError:
+            results.append({"target_path": item.target_path, "status": "error",
+                            "detail": "invalid path"})
+            continue
+        line, abspath, before, after, action, _ = _plan(item)
+        if os.path.isfile(abspath):
+            if abspath not in backed_up:
+                hw_merge.backup(abspath)
+                backed_up.add(abspath)
+        else:
+            os.makedirs(os.path.dirname(abspath), exist_ok=True)
+        sha_before = hw_merge.sha256(before.encode("utf-8")) if os.path.isfile(abspath) else None
+        w = hw_merge.atomic_write(abspath, after, item.pre_sha or sha_before)
+        results.append({"target_path": item.target_path, "status": w["status"],
+                        "detail": w["detail"]})
+        if w["status"] == "written":
+            touched.append(item.target_path)
+            journal_items.append({"path": item.target_path, "sha_before": sha_before,
+                                  "sha_after": w["sha_after"], "line": line,
+                                  "source_session_id": body.source_session_id,
+                                  "candidate_index": item.candidate_index})
+    if journal_items:
+        hw_merge.journal_append(batch_id, journal_items)
+        idx = hw_index.get_index()
+        idx._last_scan_ns = 0
+        idx.sync()
+    return [{**r, "batch_id": batch_id} for r in results]
+
+
+class UndoBody(BaseModel):
+    batch_id: str | None = None
+
+
+@router.post("/memories/undo")
+def memories_undo(body: UndoBody) -> list[dict]:
+    out = hw_merge.undo(body.batch_id)
+    idx = hw_index.get_index()
+    idx._last_scan_ns = 0
+    idx.sync()
+    return out
+
+
+@router.get("/memories/history")
+def memories_history() -> list[dict]:
+    return [{"batch_id": b["batch_id"], "ts": b["ts"],
+             "notes": sorted({it["path"] for it in b["items"]}),
+             "counts": len(b["items"])} for b in reversed(hw_merge._read_journal())]

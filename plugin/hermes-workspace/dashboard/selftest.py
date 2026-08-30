@@ -67,7 +67,67 @@ def _selfcheck_http_read() -> None:
     print("  http read round-trip ok")
 
 
+def _selfcheck_http_write() -> None:
+    import tempfile
+    import hw_store
+    import hw_index
+
+    saved_home = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            hw_store._cache = None
+            vault = os.path.join(d, "vault")
+            os.makedirs(os.path.join(vault, "Areas"))
+            argos = os.path.join(vault, "Areas", "Argos.md")
+            open(argos, "w", encoding="utf-8").write(
+                "# Argos\n\nwidget engine\n\n## History\n\n- **2026-08-20** — merged.\n")
+            original = open(argos, "rb").read()
+
+            hw_index.reset_for_tests()
+            c = _client()
+            assert c.post("/config", json={"vault": vault}).json()["vault_exists"]
+            c.post("/reindex", json={"full": True})
+
+            cands = [{"target": "Argos", "history_line": "Component 4 shipped.",
+                      "supersedes": None, "quote": "we shipped component 4"}]
+            resolved = c.post("/extract/resolve",
+                              json={"candidates": cands, "source_session_id": "sess-1"}).json()
+            assert resolved["candidates"][0]["target_path"] == "Areas/Argos.md"
+
+            items = [{"target_path": "Areas/Argos.md", "history_line": "Component 4 shipped.",
+                      "supersedes": None, "candidate_index": 0}]
+            prev = c.post("/memories/preview", json={"items": items}).json()
+            assert "Component 4 shipped." in prev[0]["diff"]
+            assert open(argos, "rb").read() == original  # preview writes nothing
+
+            # a hostile target_path is refused before touching the filesystem
+            assert c.post("/memories/preview",
+                          json={"items": [{"target_path": "../evil.md",
+                                           "history_line": "x."}]}).status_code == 400
+
+            items[0]["pre_sha"] = prev[0]["pre_sha"]
+            commit = c.post("/memories/commit",
+                            json={"items": items, "source_session_id": "sess-1"}).json()
+            assert commit[0]["status"] == "written", commit
+            assert "Component 4 shipped." in open(argos, encoding="utf-8").read()
+            batch = commit[0]["batch_id"]
+
+            undo = c.post("/memories/undo", json={"batch_id": batch}).json()
+            assert undo[0]["result"] in ("restored", "removed"), undo
+            assert open(argos, "rb").read() == original  # fully reversible
+    finally:
+        hw_index.reset_for_tests()
+        hw_store._cache = None
+        if saved_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = saved_home
+    print("  http write round-trip ok")
+
+
 if __name__ == "__main__":
     run_module_checks()
     _selfcheck_http_read()
+    _selfcheck_http_write()
     print("ok")
