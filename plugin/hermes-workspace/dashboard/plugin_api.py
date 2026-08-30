@@ -250,7 +250,7 @@ def memories_preview(body: PreviewBody) -> list[dict]:
 @router.post("/memories/commit")
 def memories_commit(body: PreviewBody) -> list[dict]:
     batch_id = uuid.uuid4().hex[:12]
-    journal_items, results, touched = [], [], []
+    journal_items, results = [], []
     backed_up: set[str] = set()
     for item in body.items:
         try:
@@ -259,23 +259,27 @@ def memories_commit(body: PreviewBody) -> list[dict]:
             results.append({"target_path": item.target_path, "status": "error",
                             "detail": "invalid path"})
             continue
-        line, abspath, before, after, action, _ = _plan(item)
-        if os.path.isfile(abspath):
-            if abspath not in backed_up:
-                hw_merge.backup(abspath)
-                backed_up.add(abspath)
-        else:
-            os.makedirs(os.path.dirname(abspath), exist_ok=True)
-        sha_before = hw_merge.sha256(before.encode("utf-8")) if os.path.isfile(abspath) else None
-        w = hw_merge.atomic_write(abspath, after, item.pre_sha or sha_before)
-        results.append({"target_path": item.target_path, "status": w["status"],
-                        "detail": w["detail"]})
-        if w["status"] == "written":
-            touched.append(item.target_path)
-            journal_items.append({"path": item.target_path, "sha_before": sha_before,
-                                  "sha_after": w["sha_after"], "line": line,
-                                  "source_session_id": body.source_session_id,
-                                  "candidate_index": item.candidate_index})
+        try:
+            line, abspath, before, after, action, _ = _plan(item)
+            if os.path.isfile(abspath):
+                if abspath not in backed_up:
+                    hw_merge.backup(abspath)
+                    backed_up.add(abspath)
+            else:
+                os.makedirs(os.path.dirname(abspath), exist_ok=True)
+            sha_before = hw_merge.sha256(before.encode("utf-8")) if os.path.isfile(abspath) else None
+            w = hw_merge.atomic_write(abspath, after, item.pre_sha or sha_before)
+            results.append({"target_path": item.target_path, "status": w["status"],
+                            "detail": w["detail"]})
+            if w["status"] == "written":
+                journal_items.append({"path": item.target_path, "sha_before": sha_before,
+                                      "sha_after": w["sha_after"], "line": line,
+                                      "source_session_id": body.source_session_id,
+                                      "candidate_index": item.candidate_index})
+        except Exception as e:  # keep journal_append + reindex reachable for the rest
+            results.append({"target_path": item.target_path, "status": "error",
+                            "detail": str(e)})
+            continue
     if journal_items:
         hw_merge.journal_append(batch_id, journal_items)
         idx = hw_index.get_index()

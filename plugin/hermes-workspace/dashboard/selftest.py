@@ -126,8 +126,73 @@ def _selfcheck_http_write() -> None:
     print("  http write round-trip ok")
 
 
+def _selfcheck_http_write_edges() -> None:
+    import tempfile
+    import hw_store
+    import hw_index
+
+    saved_home = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            hw_store._cache = None
+            vault = os.path.join(d, "vault")
+            os.makedirs(os.path.join(vault, "Areas"))
+            a = os.path.join(vault, "Areas", "A.md")
+            b = os.path.join(vault, "Areas", "B.md")
+            open(a, "w", encoding="utf-8").write("# A\n\n## History\n\n- **2026-08-01** — one.\n")
+            open(b, "w", encoding="utf-8").write("# B\n\n## History\n\n- **2026-08-01** — one.\n")
+
+            hw_index.reset_for_tests()
+            c = _client()
+            c.post("/config", json={"vault": vault})
+            c.post("/reindex", json={"full": True})
+
+            # /extract/prepare flattens list-style content blocks
+            prep = c.post("/extract/prepare", json={"messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"},
+                                             {"type": "text", "text": "world"}]},
+                {"role": "assistant", "content": "ok"}]}).json()
+            tt = prep["transcript_text"]
+            assert "hello world" in tt and "ok" in tt and "[object" not in tt and "{'" not in tt
+
+            # 3-item batch: item 2 has a wrong pre_sha -> conflict, 1 & 3 still written
+            items = [
+                {"target_path": "Areas/A.md", "history_line": "alpha added.", "candidate_index": 0},
+                {"target_path": "Areas/B.md", "history_line": "beta added.",
+                 "candidate_index": 1, "pre_sha": "deadbeef"},
+                {"target_path": "Areas/A.md", "history_line": "gamma added.", "candidate_index": 2},
+            ]
+            res = c.post("/memories/commit",
+                         json={"items": items, "source_session_id": "s"}).json()
+            assert [r["status"] for r in res] == ["written", "conflict", "written"], res
+            atext = open(a, encoding="utf-8").read()
+            assert "alpha added." in atext and "gamma added." in atext
+            assert "beta added." not in open(b, encoding="utf-8").read()
+            batch = res[0]["batch_id"]
+            hist = c.get("/memories/history").json()
+            entry = next(h for h in hist if h["batch_id"] == batch)
+            assert entry["counts"] == 2, entry  # item 2 not journaled
+
+            # commit-side guard rejection
+            bad = c.post("/memories/commit", json={"items": [
+                {"target_path": "../evil.md", "history_line": "x."}]}).json()
+            assert bad[0]["status"] == "error" and bad[0]["detail"] == "invalid path"
+            assert not os.path.exists(os.path.join(d, "evil.md"))
+            assert not os.path.exists(os.path.join(vault, "..", "evil.md"))
+    finally:
+        hw_index.reset_for_tests()
+        hw_store._cache = None
+        if saved_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = saved_home
+    print("  http write edges ok")
+
+
 if __name__ == "__main__":
     run_module_checks()
     _selfcheck_http_read()
     _selfcheck_http_write()
+    _selfcheck_http_write_edges()
     print("ok")
