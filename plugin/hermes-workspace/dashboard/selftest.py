@@ -1,4 +1,4 @@
-"""Run every module self-check plus a full HTTP round-trip. `python selftest.py [--big]`."""
+"""Run every module self-check plus the full HTTP read + write + reversible round-trip. Usage: python selftest.py"""
 import os
 import sys
 

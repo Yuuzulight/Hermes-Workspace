@@ -28,8 +28,8 @@ v1 ships the **Knowledge** module:
        - hermes-workspace
    ```
 3. Restart Hermes Desktop.
-4. Open the **Knowledge** pane (sidebar, or the "Toggle Knowledge" command
-   palette entry) and set your vault folder in the plugin settings.
+4. Open the **Knowledge** pane via the "Toggle Knowledge" command in the
+   command palette, then set your vault folder in the plugin settings.
 5. Optional: drop an `agent_rules.md` in your vault (or point `rules_file` at
    one) to override the default capture conventions. See
    `plugin/hermes-workspace/dashboard/default_rules.md` for the defaults.
