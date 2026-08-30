@@ -17,13 +17,13 @@ Built as one plan in four phases. Each phase is a working, useful increment:
 | Phase | Delivers | Standalone value |
 |---|---|---|
 | **1** | 3 agent tools + a transcript-scan fallback + a persistent versioned store + a tab with a textarea editor, a preview, and a version stepper. Content types: code, HTML, SVG, Markdown, Mermaid. | Durable versioned artifacts you can edit and preview. |
-| **2** | `type: react` + an esbuild-wasm runtime: transpile + bundle the artifact and its imported libraries into a sandboxed iframe, with error surfacing and a console panel. | React/JSX artifacts run live. |
+| **2** | `type: react` + an esbuild-wasm runtime: transpile + bundle the artifact and its imported libraries into a sandboxed iframe, with error surfacing and a console panel. The Phase 1 textarea is replaced with a real CodeMirror 6 editor (loaded on the same vendored-asset pipeline). | React/JSX artifacts run live; editing is a proper code editor. |
 | **3** | Standalone `.html` export (everything inlined) + "Publish to Gist". | Artifacts leave Hermes as portable files or links. |
 | **4** | A `window.hermes` bridge into the artifact iframe: `complete`, `storage`, `readFile`. | Artifacts become interactive AI mini-apps. |
 
-Not built: a real code editor (the SDK exports no editor; textarea is the
-ceiling), artifact sharing between users, Hermes' built-in artifact system (left
-alone — Creator runs in parallel).
+Not built: artifact sharing between users; Monaco (too heavy — ~5 MB, AMD loader,
+web workers; CodeMirror 6 is the editor, landing in Phase 2); Hermes' built-in
+artifact system (left alone — Creator runs in parallel).
 
 ## 2. What Hermes already provides
 
@@ -219,8 +219,9 @@ desktop/plugin.js      + a "// ===== CREATOR =====" section. Adds ONLY new top-l
                        (cr_* prefix); references ZERO Knowledge symbols. Knowledge's register(ctx)
                        body gains exactly one guarded call (crRegister(ctx) in try/catch), placed
                        AFTER Knowledge's own registration. Budget ~1200 -> ~3000 lines across phases.
-desktop/plugin.js  --  Phase 2+ adds the esbuild-wasm driver, the iframe host, the console panel;
-                       Phase 4 adds the postMessage bridge.
+desktop/plugin.js  --  Phase 2+ adds the esbuild-wasm driver, the iframe host, the console panel,
+                       and the blob-module loader that pulls in CodeMirror 6; Phase 4 adds the
+                       postMessage bridge.
 dashboard/plugin_api.py  + import logging  AND  defensively:
                            try:
                                import cr_api
@@ -230,9 +231,10 @@ dashboard/plugin_api.py  + import logging  AND  defensively:
 dashboard/cr_api.py    NEW. Module-level imports = stdlib + FastAPI only. Loads cr_store by explicit
                        path. router = APIRouter(). SessionDB import inside the scan handler.
                        Serves GET /creator/asset/{name} (Phase 2 — raw bytes of a vendored file).
-dashboard/creator-libs/  NEW (Phase 2). Committed. ~15 MB: single-file ESM builds of the curated
-                       import set, the Tailwind browser build, esbuild.wasm. Served byte-for-byte
-                       by cr_api's asset route; the renderer fetches via ctx.rest.
+dashboard/creator-libs/  NEW (Phase 2). Committed. ~16 MB: single-file ESM builds of the curated
+                       import set, the Tailwind browser build, esbuild.wasm, and codemirror.js
+                       (a pre-bundled CodeMirror 6 + language modes, ~1 MB, zero external imports).
+                       Served byte-for-byte by cr_api's asset route; the renderer fetches via ctx.rest.
 dashboard/selftest.py  loads cr_store by explicit path + appends a Creator HTTP round-trip. Additive.
 ```
 
@@ -459,9 +461,10 @@ Tab content:
   (current content), a `Delete` `Button` (behind `ConfirmDialog`).
 - **Body** — editor + preview, arranged by a **CSS container query**: side-by-side
   when the pane is wide, stacked when narrow. No layout control.
-  - **Editor**: the SDK `Textarea`, monospace, tab-to-indent, a dirty dot, an
-    explicit **Save** (button + ⌘S) → `POST /artifacts/{id}/versions`. Stepping
-    to an older version shows it read-only.
+  - **Editor** (Phase 1): the SDK `Textarea`, monospace, tab-to-indent, a dirty
+    dot, an explicit **Save** (button + ⌘S) → `POST /artifacts/{id}/versions`.
+    Stepping to an older version shows it read-only. **Phase 2 replaces this with
+    CodeMirror 6** (§6.6) behind the same dirty-dot / Save / read-only contract.
   - **Preview**:
 
     | type | preview |
@@ -477,9 +480,14 @@ Tab content:
 
 ### 6.1 Assets
 
-`dashboard/creator-libs/` (committed, ~15 MB):
+`dashboard/creator-libs/` (committed, ~16 MB):
 
 - `esbuild.wasm` (~10 MB).
+- `codemirror.js` (~1 MB) — a pre-bundled CodeMirror 6: `@codemirror/{state,
+  view,commands,language,search,autocomplete}`, `@codemirror/lang-{javascript,
+  html,css,python,markdown}`, one theme, `@lezer/*`. Bundled offline with
+  esbuild into one ESM file with **zero external imports** so
+  `import(blobURL)` resolves with nothing to fetch.
 - Single-file ESM builds of the curated set: `react`, `react-dom`, `recharts`,
   `lucide-react`, `d3`, `three` + `@react-three/fiber` + `@react-three/drei`,
   `papaparse`, `xlsx`, `mathjs`, `tone`, `@tanstack/react-table`, `lodash-es`,
@@ -554,6 +562,28 @@ Import from the standard set: react, recharts, lucide-react, d3, three, lodash,
 date-fns, papaparse, xlsx, mathjs, tone, @tanstack/react-table, and shadcn/ui.
 Tailwind classes work."*). The full list also goes in the prompt so the model
 knows what it can import.
+
+### 6.6 CodeMirror editor (replaces the Phase 1 textarea)
+
+- **Load**: on first editor mount, `ctx.rest`-fetch `codemirror.js` text →
+  `import(URL.createObjectURL(new Blob([text], {type:'text/javascript'})))` —
+  the same blob-module mechanism Hermes uses for `plugin.js`, and the module has
+  no imports to resolve. The resolved module is cached for the plugin's
+  lifetime. If the fetch/import fails, fall back to the Phase 1 `Textarea` and
+  show a one-line notice — editing never breaks.
+- **Component**: a thin React wrapper (~50 lines) — a `useRef` div, one
+  `EditorView` created on mount and destroyed on unmount, `dispatch` to push
+  external content changes (version stepping) in, an `updateListener` to raise
+  the dirty flag. No `@uiw/react-codemirror` dependency; hand-wired.
+- **Config**: line numbers, current-line highlight, bracket matching, history,
+  search panel (⌘F), close-brackets, the language mode picked from
+  `artifact.language` / `type` (`javascript`/`jsx`/`tsx` → the JS mode with the
+  right flags; `html`, `css`, `python`, `markdown`; unknown → no mode). A theme
+  derived from the Hermes CSS variables so it matches light/dark. `EditorState.
+  readOnly` when viewing a non-latest version.
+- **Contract unchanged**: same dirty dot, same explicit Save (button + ⌘S) →
+  `POST /artifacts/{id}/versions`, same read-only-on-old-version behaviour. The
+  header, picker, stepper, preview, and every backend path are untouched.
 
 ## 7. Phase 3 — export & publish
 
@@ -712,7 +742,13 @@ Phase 1 unit targets (each with the assert that fails if the logic breaks):
 Phase 2: `esbuild.build` of a fixture React artifact importing `recharts` →
 one ESM string, no diagnostics; a syntax-error artifact → diagnostics, no
 bundle; the vfs resolver pulls the right sub-deps from `MANIFEST.json`. Asset
-route: `GET /creator/asset/react.js` → the exact bytes.
+route: `GET /creator/asset/react.js` → the exact bytes; `GET /creator/asset/
+codemirror.js` → the exact bytes, and a `node --check`-style parse of the
+vendored file (asserts it is valid ESM with no bare/relative import
+specifiers, so `import(blobURL)` will resolve). CodeMirror wrapper: mounting
+it against a fixture artifact yields an `EditorView`; a content prop change
+replaces the doc; `readOnly` blocks edits; import failure falls back to the
+textarea.
 
 Phase 3: export of each type → a self-contained file that opens standalone;
 `react` export is minified and inlines Tailwind. Gist path: `gh` present →
@@ -729,7 +765,9 @@ confirm enforced in the plugin render; `storage` round-trips through
 No headless Hermes — a manual checklist per phase (create from a chat; edit +
 save → new version; step + restore; each content type renders; the picker;
 backend-restart resilience; Phase 2: a React artifact runs, an error shows, the
-console panel works; Phase 3: export opens standalone, Gist link works; Phase 4:
+console panel works, the CodeMirror editor loads and highlights/searches and
+falls back to the textarea if its asset is removed; Phase 3: export opens
+standalone, Gist link works; Phase 4:
 `complete` prompts once then works, `storage` persists across a tab close,
 `readFile` sees only what the indicator lists).
 
@@ -740,8 +778,10 @@ console panel works; Phase 3: export opens standalone, Gist link works; Phase 4:
 2. **`esbuild.build` latency per preview keystroke burst** — mitigated by debounce
    + content-hash cache + lib-source cache; a fast path that re-bundles only when
    imports change is a later refinement.
-3. **`creator-libs/` is ~15 MB in git** — a one-time cost; `.gitignore` does not
-   exclude it; updating a lib re-vendors one file.
+3. **`creator-libs/` is ~16 MB in git** — a one-time cost; `.gitignore` does not
+   exclude it; updating a lib (esbuild, CodeMirror, a React lib) re-vendors one
+   file. The offline bundle step (esbuild bundling CodeMirror + the lib set into
+   zero-import ESM files) is a committed script, not a runtime dependency.
 4. **Threshold drift from Hermes core** — Creator owns the thresholds (not a
    port); one named constant block, a comment pointing at the upstream file.
 5. **Shared-import fragility** — `cr_store.py` stdlib-only + relative-import-free;
