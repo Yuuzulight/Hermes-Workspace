@@ -616,6 +616,468 @@ function KnowledgeStatusItem() {
   })
 }
 
+// ── Memory extraction: palette command + approval pane ─────────────────────
+// `session.history` / `llm.oneshot` are newer gateway RPCs. Probe once on load;
+// if absent, the extract/undo commands never register — the read path (toggle,
+// middleware, pane) is wired before this and is unaffected. isMissingRpcMethod
+// (apps/desktop/src/lib/gateway-rpc.ts) is not re-exported by the SDK, so its
+// regex is inlined here — one file by contract.
+const MISSING_RPC = /method not found|-32601|unknown method|no such method/i
+
+let RPC_OK = null
+async function rpcAvailable() {
+  if (RPC_OK !== null) return RPC_OK
+  try {
+    const sid = host.state.focusedSessionId.get() || host.state.activeSessionId.get()
+    await host.request('session.history', { session_id: sid })
+    RPC_OK = true
+  } catch (e) {
+    // A "no session" / "gateway unavailable" error still proves the method
+    // exists — only a missing-method error gates the feature off.
+    RPC_OK = !MISSING_RPC.test(String((e && e.message) || e))
+  }
+  return RPC_OK
+}
+
+function sessionId() {
+  return (
+    host.state.focusedStoredSessionId.get() ||
+    host.state.focusedSessionId.get() ||
+    host.state.activeSessionId.get() ||
+    ''
+  )
+}
+
+// Transient pane. `Contribution.when` is NOT reactive (re-checked only on a
+// registry mutation in its area), so instead of gating a permanent pane we
+// register the contribution on open and dispose it on close.
+const approval$ = atom({
+  open: false,
+  phase: 'idle', // idle | loading | review | preview | result | error
+  cards: [],
+  rejected: [],
+  preview: null,
+  result: null,
+  error: '',
+})
+let approvalDispose = null
+
+function openApproval(next) {
+  approval$.set({
+    open: true,
+    phase: 'idle',
+    cards: [],
+    rejected: [],
+    preview: null,
+    result: null,
+    error: '',
+    ...next,
+  })
+  if (!approvalDispose && CTX) {
+    approvalDispose = CTX.register({
+      id: 'memory-approval',
+      area: PANES_AREA,
+      title: 'Memory approval',
+      data: { placement: 'right', width: '420px' },
+      render: () => jsx(ApprovalPane, {}),
+    })
+  }
+}
+
+function closeApproval() {
+  approval$.set({
+    open: false,
+    phase: 'idle',
+    cards: [],
+    rejected: [],
+    preview: null,
+    result: null,
+    error: '',
+  })
+  if (approvalDispose) {
+    approvalDispose()
+    approvalDispose = null
+  }
+}
+
+async function callModelAndParse(instructions, input, sid) {
+  // Param names match apps/desktop/src/lib/oneshot.ts's snake_case gateway call
+  // (maxTokens→max_tokens, sessionId→session_id); returns { text }.
+  const r = await host.request('llm.oneshot', {
+    instructions,
+    input,
+    session_id: sid || undefined,
+    temperature: 0,
+    max_tokens: 2048,
+  })
+  return api('/extract/parse', { method: 'POST', body: { raw: (r && r.text) || '' } })
+}
+
+async function runExtraction() {
+  const sid = sessionId()
+  openApproval({ phase: 'loading' })
+  let messages
+  try {
+    const r = await host.request('session.history', {
+      session_id: host.state.focusedSessionId.get() || host.state.activeSessionId.get() || sid,
+    })
+    messages = (r && r.messages) || []
+  } catch (e) {
+    if (MISSING_RPC.test(String((e && e.message) || e))) {
+      RPC_OK = false
+      closeApproval()
+      host.notify({ kind: 'warning', message: 'Memory extraction is unavailable on this Hermes build.' })
+      return
+    }
+    openApproval({ phase: 'error', error: 'Could not read this chat: ' + ((e && e.message) || e) })
+    return
+  }
+  try {
+    const prep = await api('/extract/prepare', { method: 'POST', body: { messages } })
+    let parsed = await callModelAndParse(prep.prompt, prep.transcript_text, sid)
+    if (parsed.error === 'model_output_unparseable') {
+      parsed = await callModelAndParse(
+        prep.prompt + '\n\nYour previous reply was not valid JSON. Return only the JSON object.',
+        prep.transcript_text,
+        sid,
+      )
+    }
+    if (parsed.error) {
+      openApproval({ phase: 'error', error: 'The model did not return usable JSON.' })
+      return
+    }
+    const resolved = await api('/extract/resolve', {
+      method: 'POST',
+      body: { candidates: parsed.candidates, source_session_id: sid },
+    })
+    const cards = (resolved.candidates || []).map((c) => ({
+      ...c,
+      checked: !c.duplicate,
+      history_line: c.history_line,
+      target_path: c.target_path,
+      quoteOpen: false,
+    }))
+    openApproval({ phase: 'review', cards, rejected: parsed.rejected || [] })
+  } catch (e) {
+    if (MISSING_RPC.test(String((e && e.message) || e))) {
+      RPC_OK = false
+      closeApproval()
+      host.notify({ kind: 'warning', message: 'Memory extraction is unavailable on this Hermes build.' })
+      return
+    }
+    openApproval({ phase: 'error', error: String((e && e.message) || e) })
+  }
+}
+
+function selectedItems(s) {
+  return s.cards
+    .filter((c) => c.checked)
+    .map((c) => ({
+      target_path: c.target_path,
+      history_line: c.history_line,
+      supersedes: c.supersedes || null,
+      candidate_index: c.candidate_index,
+    }))
+}
+
+async function doPreview(s) {
+  try {
+    const preview = await api('/memories/preview', {
+      method: 'POST',
+      body: { items: selectedItems(s), source_session_id: sessionId() },
+    })
+    approval$.set({ ...approval$.get(), phase: 'preview', preview })
+  } catch (e) {
+    approval$.set({ ...approval$.get(), phase: 'error', error: String((e && e.message) || e) })
+  }
+}
+
+async function doCommit(s) {
+  const items = selectedItems(s)
+  try {
+    const preview =
+      s.preview ||
+      (await api('/memories/preview', {
+        method: 'POST',
+        body: { items, source_session_id: sessionId() },
+      }))
+    preview.forEach((p, i) => {
+      if (items[i]) items[i].pre_sha = p.pre_sha
+    })
+    const res = await api('/memories/commit', {
+      method: 'POST',
+      body: { items, source_session_id: sessionId() },
+    })
+    const wrote = res.filter((r) => r.status === 'written').length
+    approval$.set({
+      ...approval$.get(),
+      phase: 'result',
+      result: { items: res, wrote, batch: res[0] && res[0].batch_id },
+    })
+    host.notify({ kind: 'success', message: `Wrote ${wrote} note(s) to the vault` })
+  } catch (e) {
+    approval$.set({ ...approval$.get(), phase: 'error', error: String((e && e.message) || e) })
+  }
+}
+
+function ApprovalPane() {
+  const s = useValue(approval$)
+  if (!s.open) return null
+  const pad = { padding: 12, fontSize: 13 }
+
+  if (s.phase === 'loading') {
+    return jsx('div', { style: pad, children: 'Reading this chat and extracting memories…' })
+  }
+  if (s.phase === 'error') {
+    return jsxs('div', {
+      style: pad,
+      children: [
+        jsx('div', { style: { marginBottom: 8 }, children: s.error || 'Something went wrong.' }),
+        jsx(Button, { size: 'sm', variant: 'ghost', onClick: closeApproval, children: 'Close' }),
+      ],
+    })
+  }
+
+  if (s.phase === 'result') {
+    return jsxs('div', {
+      style: { ...pad, display: 'flex', flexDirection: 'column', gap: 8, height: '100%', overflow: 'auto' },
+      children: [
+        jsx('div', {
+          style: { fontWeight: 700 },
+          children: `Wrote ${s.result.wrote} of ${s.result.items.length} note(s)`,
+        }),
+        s.result.items.map((r, i) =>
+          jsx('div', {
+            style: { fontSize: 12 },
+            children:
+              (r.status === 'written' ? '✓ ' : '• ') +
+              r.target_path +
+              ' — ' +
+              r.status +
+              (r.detail ? ` (${r.detail})` : ''),
+          }, i),
+        ),
+        jsxs('div', {
+          style: { display: 'flex', gap: 6, marginTop: 8 },
+          children: [
+            s.result.batch
+              ? jsx(Button, {
+                  size: 'sm',
+                  variant: 'ghost',
+                  onClick: () => {
+                    api('/memories/undo', { method: 'POST', body: { batch_id: s.result.batch } })
+                      .then((r) => host.notify({ kind: 'info', message: `Undid ${r.length} write(s)` }))
+                      .catch((e) => host.notifyError(e, 'Undo failed'))
+                    closeApproval()
+                  },
+                  children: 'Undo this batch',
+                })
+              : null,
+            jsx(Button, { size: 'sm', onClick: closeApproval, children: 'Done' }),
+          ],
+        }),
+      ],
+    })
+  }
+
+  if (s.phase === 'preview') {
+    return jsxs('div', {
+      style: { ...pad, display: 'flex', flexDirection: 'column', gap: 8, height: '100%', overflow: 'auto' },
+      children: [
+        jsx('div', { style: { fontWeight: 700 }, children: `Preview — ${s.preview.length} note(s)` }),
+        s.preview.map((p, i) =>
+          jsxs('div', {
+            children: [
+              jsx('div', {
+                style: { fontWeight: 600, fontSize: 12 },
+                children: p.target_path + (p.action === 'create' ? '  (will be created)' : ''),
+              }),
+              jsx('pre', {
+                style: {
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  fontSize: 11,
+                  background: 'var(--ui-bg-tertiary, rgba(128,128,128,0.08))',
+                  padding: 6,
+                  margin: '2px 0',
+                  borderRadius: 4,
+                  fontFamily: 'inherit',
+                },
+                children: p.diff || '(no textual change)',
+              }),
+            ],
+          }, i),
+        ),
+        jsxs('div', {
+          style: { display: 'flex', gap: 6 },
+          children: [
+            jsx(Button, {
+              size: 'sm',
+              onClick: () => doCommit(s),
+              children: `Write ${s.preview.length} note(s)`,
+            }),
+            jsx(Button, {
+              size: 'sm',
+              variant: 'ghost',
+              onClick: () => approval$.set({ ...s, phase: 'review', preview: null }),
+              children: 'Back',
+            }),
+          ],
+        }),
+      ],
+    })
+  }
+
+  // phase === 'review'
+  const patch = (i, p) =>
+    approval$.set({ ...s, cards: s.cards.map((c, j) => (j === i ? { ...c, ...p } : c)) })
+  const selected = s.cards.filter((c) => c.checked)
+
+  const order = []
+  const byPath = {}
+  s.cards.forEach((c, i) => {
+    if (!byPath[c.target_path]) {
+      byPath[c.target_path] = []
+      order.push(c.target_path)
+    }
+    byPath[c.target_path].push([c, i])
+  })
+
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontSize: 13 },
+    children: [
+      jsx('div', {
+        style: { padding: '8px 10px', fontWeight: 700, borderBottom: '1px solid rgba(128,128,128,0.2)' },
+        children: 'Review memories',
+      }),
+      jsx('div', {
+        style: { overflow: 'auto', flex: 1, minHeight: 0, padding: 8 },
+        children: jsxs('div', {
+          children: [
+            s.cards.length === 0
+              ? jsx('div', {
+                  style: { fontSize: 12, opacity: 0.6, padding: 8 },
+                  children: 'No memories found in this chat.',
+                })
+              : null,
+            order.map((tp) =>
+              jsxs('div', {
+                style: { marginBottom: 10 },
+                children: [
+                  jsx('div', {
+                    style: { fontWeight: 700, fontSize: 12, margin: '6px 0 2px' },
+                    children:
+                      '→ ' +
+                      tp +
+                      (byPath[tp][0][0].action === 'create' ? '  (will be created)' : '  (existing)'),
+                  }),
+                  byPath[tp].map(([c, i]) =>
+                    jsxs('div', {
+                      style: {
+                        borderLeft: '2px solid rgba(128,128,128,0.35)',
+                        padding: '4px 8px',
+                        margin: '4px 0',
+                      },
+                      children: [
+                        jsxs('label', {
+                          style: { display: 'flex', gap: 6, alignItems: 'center', fontSize: 11 },
+                          children: [
+                            jsx('input', {
+                              type: 'checkbox',
+                              checked: !!c.checked,
+                              onChange: (e) => patch(i, { checked: e.target.checked }),
+                            }),
+                            c.duplicate
+                              ? jsx('span', {
+                                  style: { color: '#e5a11d' },
+                                  children:
+                                    c.reason === 'already_written' ? 'already saved' : 'possible duplicate',
+                                })
+                              : null,
+                            c.warning
+                              ? jsx('span', { style: { color: '#e5a11d' }, children: c.warning })
+                              : null,
+                          ],
+                        }),
+                        jsx('textarea', {
+                          value: c.history_line,
+                          rows: 2,
+                          onChange: (e) => patch(i, { history_line: e.target.value }),
+                          style: {
+                            width: '100%',
+                            boxSizing: 'border-box',
+                            fontSize: 12,
+                            marginTop: 4,
+                            fontFamily: 'inherit',
+                          },
+                        }),
+                        jsxs('div', {
+                          style: { display: 'flex', gap: 4, alignItems: 'center', marginTop: 2, fontSize: 11 },
+                          children: [
+                            jsx('span', { style: { opacity: 0.6 }, children: 'note:' }),
+                            jsx('input', {
+                              value: c.target_path,
+                              onChange: (e) => patch(i, { target_path: e.target.value }),
+                              style: { flex: 1, fontSize: 11, fontFamily: 'inherit' },
+                            }),
+                          ],
+                        }),
+                        c.colliding_line
+                          ? jsx('div', {
+                              style: { fontSize: 11, opacity: 0.6, marginTop: 2 },
+                              children: 'collides with: ' + c.colliding_line,
+                            })
+                          : null,
+                        c.quote
+                          ? jsxs('div', {
+                              style: { fontSize: 11, marginTop: 2 },
+                              children: [
+                                jsx('button', {
+                                  type: 'button',
+                                  onClick: () => patch(i, { quoteOpen: !c.quoteOpen }),
+                                  style: { ...stripLinkStyle, marginLeft: 0 },
+                                  children: c.quoteOpen ? 'hide quote' : 'show quote',
+                                }),
+                                c.quoteOpen
+                                  ? jsx('div', {
+                                      style: { opacity: 0.6, fontStyle: 'italic', marginTop: 2 },
+                                      children: c.quote,
+                                    })
+                                  : null,
+                              ],
+                            })
+                          : null,
+                      ],
+                    }, i),
+                  ),
+                ],
+              }, tp),
+            ),
+            s.rejected && s.rejected.length
+              ? jsx('div', {
+                  style: { opacity: 0.5, fontSize: 11, marginTop: 8 },
+                  children: `${s.rejected.length} candidate(s) discarded`,
+                })
+              : null,
+          ],
+        }),
+      }),
+      jsxs('div', {
+        style: { display: 'flex', gap: 6, padding: 8, borderTop: '1px solid rgba(128,128,128,0.2)' },
+        children: [
+          jsx(Button, {
+            size: 'sm',
+            disabled: !selected.length,
+            onClick: () => doPreview(s),
+            children: `Preview & write (${selected.length} selected)`,
+          }),
+          jsx(Button, { size: 'sm', variant: 'ghost', onClick: closeApproval, children: 'Cancel' }),
+        ],
+      }),
+    ],
+  })
+}
+
 export default {
   id: PLUGIN_ID,
   name: 'Knowledge',
@@ -685,5 +1147,57 @@ export default {
         },
       },
     ])
+
+    // "Reindex vault" always registers — plain REST, no newer RPC needed.
+    ctx.register({
+      id: 'palette-reindex',
+      area: PALETTE_AREA,
+      data: {
+        id: 'hermes-workspace.reindex-vault',
+        label: 'Reindex vault',
+        keywords: ['reindex', 'vault', 'knowledge', 'rebuild', 'index', 'obsidian'],
+        run: () =>
+          api('/reindex', { method: 'POST', body: { full: true } })
+            .then((r) => host.notify({ kind: 'info', message: `Indexed ${(r && r.indexed) || 0} note(s)` }))
+            .catch((e) => host.notifyError(e, 'Reindex failed')),
+      },
+    })
+
+    // The extraction commands touch session.history + llm.oneshot. Gate them
+    // on a one-time probe; the read path above is already wired and untouched.
+    rpcAvailable().then((ok) => {
+      if (!ok) {
+        host.notify({
+          kind: 'info',
+          message: 'Chat memory extraction is unavailable on this Hermes build.',
+        })
+        return
+      }
+      ctx.registerMany([
+        {
+          id: 'palette-extract',
+          area: PALETTE_AREA,
+          data: {
+            id: 'hermes-workspace.extract-memories',
+            label: 'Extract memories from this chat',
+            keywords: ['memory', 'memories', 'extract', 'knowledge', 'vault', 'save', 'remember'],
+            run: runExtraction,
+          },
+        },
+        {
+          id: 'palette-undo-extract',
+          area: PALETTE_AREA,
+          data: {
+            id: 'hermes-workspace.undo-memory-extraction',
+            label: 'Undo last memory extraction',
+            keywords: ['memory', 'undo', 'revert', 'knowledge', 'vault'],
+            run: () =>
+              api('/memories/undo', { method: 'POST', body: {} })
+                .then((r) => host.notify({ kind: 'info', message: `Undid ${(r && r.length) || 0} write(s)` }))
+                .catch((e) => host.notifyError(e, 'Undo failed')),
+          },
+        },
+      ])
+    })
   },
 }
