@@ -17,7 +17,7 @@ Built as one plan in four phases. Each phase is a working, useful increment:
 | Phase | Delivers | Standalone value |
 |---|---|---|
 | **1** | 3 agent tools + a transcript-scan fallback + a persistent versioned store + a tab with a textarea editor, a preview, and a version stepper. Content types: code, HTML, SVG, Markdown, Mermaid. | Durable versioned artifacts you can edit and preview. |
-| **2** | `type: react` + an esbuild-wasm runtime: transpile + bundle the artifact and its imported libraries into a sandboxed iframe, with error surfacing and a console panel. The Phase 1 textarea is replaced with a real CodeMirror 6 editor (loaded on the same vendored-asset pipeline). | React/JSX artifacts run live; editing is a proper code editor. |
+| **2** | `type: react` + an esbuild-wasm runtime: transpile + bundle the artifact and its imported libraries into a sandboxed iframe, per-artifact Tailwind compiled in-frame, with error surfacing and a console panel. The Phase 1 textarea is replaced with a real CodeMirror 6 editor (both loaded on the same vendored-asset pipeline). | React/JSX artifacts run live with full Tailwind; editing is a proper code editor. |
 | **3** | Standalone `.html` export (everything inlined) + "Publish to Gist". | Artifacts leave Hermes as portable files or links. |
 | **4** | A `window.hermes` bridge into the artifact iframe: `complete`, `storage`, `readFile`. | Artifacts become interactive AI mini-apps. |
 
@@ -472,7 +472,7 @@ Tab content:
     | `code` | editor only (the textarea is the view); no separate render |
     | `markdown` | `<Streamdown>{content}</Streamdown>` |
     | `mermaid` | `<Streamdown>` with a ```` ```mermaid ```` fence |
-    | `html` | own `<iframe sandbox="allow-scripts" srcDoc={…}>`, opaque origin, theme prelude; a fragment wrapped in a minimal doc + reset |
+    | `html` | own `<iframe sandbox="allow-scripts" srcDoc={…}>`, opaque origin, theme prelude; a fragment wrapped in a minimal doc + reset. Phase 2 also inlines `tailwind.browser.js` here unless the document already links its own Tailwind |
     | `svg` | `<img src="data:image/svg+xml;base64,…">` — script-safe |
     | `react` | Phase 2 |
 
@@ -494,7 +494,10 @@ Tab content:
   `date-fns`, plus the shadcn/ui + Radix primitive set. Each is a single ESM
   file produced from a pre-built source (e.g. esm.sh output) and committed. A
   `MANIFEST.json` maps import specifier → filename + sub-dependencies.
-- `tailwind.browser.js` — the Tailwind browser/runtime build.
+- `tailwind.browser.js` (~0.4 MB) — the Tailwind v4 in-browser compiler
+  (`@tailwindcss/browser`), a single self-contained script. It scans the live
+  DOM and emits a `<style>` — no config file, no build step, arbitrary utility
+  classes, and a per-artifact `@theme` block for customization.
 
 `cr_api.py`'s `GET /creator/asset/{name}` returns the raw bytes.
 
@@ -525,16 +528,19 @@ tokens are detected.
 `<iframe sandbox="allow-scripts" srcDoc={doc}>`, opaque origin, theme prelude
 (copied from `inline-preview-directive.tsx`'s `themePrelude()`). The `srcDoc`:
 
-- `<style>` — the compiled Tailwind CSS for this artifact (Phase 2: ship a
-  precompiled "kitchen-sink" Tailwind stylesheet in `creator-libs/`; a
-  per-artifact JIT compile is a later refinement).
+- `<script>` — `tailwind.browser.js` inlined verbatim (the Tailwind v4 compiler),
+  optionally preceded by `<style type="text/tailwindcss">@theme { … }</style>`
+  when the artifact declares custom tokens. It compiles the DOM's classes to a
+  `<style>` on load and on mutation — real per-artifact JIT, any class the model
+  writes.
 - `<div id="root">`.
 - `<script type="module">` — the bundled artifact ESM string inlined verbatim,
   then a bootstrap: `import App from ...; createRoot(root).render(<App/>)`
   wrapped in a try/catch and a React error boundary.
 - The **error + console bridge script** (6.4), carrying this mount's nonce.
 
-No import map, no external fetches — everything is in the string.
+No import map, no external fetches — everything (libs, artifact, Tailwind
+compiler) is inlined into the string.
 
 ### 6.4 Feedback surfaces
 
@@ -596,7 +602,10 @@ knows what it can import.
   server-side via a small bundled renderer, or shipped as the raw file for
   `code`).
 - `type=react` → the renderer produces the bundle (esbuild `build` with
-  `minify:true` + the Tailwind CSS inlined) and POSTs it to a
+  `minify:true`), then freezes the Tailwind output: it renders the artifact in a
+  hidden iframe, lets `tailwind.browser.js` compile, reads the generated
+  `<style>` back out, and inlines that static CSS (so the export carries frozen
+  CSS, not the ~0.4 MB compiler). It POSTs the finished HTML to a
   `POST /artifacts/{id}/export/bundle {html}` companion endpoint that writes the
   file. (The bundle must be built in the renderer where esbuild-wasm lives; the
   dashboard just persists it.)
@@ -741,9 +750,12 @@ Phase 1 unit targets (each with the assert that fails if the logic breaks):
 
 Phase 2: `esbuild.build` of a fixture React artifact importing `recharts` →
 one ESM string, no diagnostics; a syntax-error artifact → diagnostics, no
-bundle; the vfs resolver pulls the right sub-deps from `MANIFEST.json`. Asset
-route: `GET /creator/asset/react.js` → the exact bytes; `GET /creator/asset/
-codemirror.js` → the exact bytes, and a `node --check`-style parse of the
+bundle; the vfs resolver pulls the right sub-deps from `MANIFEST.json`. Tailwind:
+a fixture artifact using an arbitrary class (`grid-cols-[1fr_2fr]`) plus a
+`@theme` token → the in-frame compiler emits matching CSS; the export path reads
+the frozen `<style>` back and the offline compiler is absent from the file.
+Asset route: `GET /creator/asset/react.js` → the exact bytes; `GET /creator/
+asset/codemirror.js` → the exact bytes, and a `node --check`-style parse of the
 vendored file (asserts it is valid ESM with no bare/relative import
 specifiers, so `import(blobURL)` will resolve). CodeMirror wrapper: mounting
 it against a fixture artifact yields an `EditorView`; a content prop change
@@ -765,9 +777,10 @@ confirm enforced in the plugin render; `storage` round-trips through
 No headless Hermes — a manual checklist per phase (create from a chat; edit +
 save → new version; step + restore; each content type renders; the picker;
 backend-restart resilience; Phase 2: a React artifact runs, an error shows, the
-console panel works, the CodeMirror editor loads and highlights/searches and
-falls back to the textarea if its asset is removed; Phase 3: export opens
-standalone, Gist link works; Phase 4:
+console panel works, arbitrary Tailwind classes render, the CodeMirror editor
+loads and highlights/searches and falls back to the textarea if its asset is
+removed; Phase 3: export opens standalone (and styled, with no compiler in the
+file), Gist link works; Phase 4:
 `complete` prompts once then works, `storage` persists across a tab close,
 `readFile` sees only what the indicator lists).
 
@@ -777,7 +790,8 @@ standalone, Gist link works; Phase 4:
    tuned in testing.
 2. **`esbuild.build` latency per preview keystroke burst** — mitigated by debounce
    + content-hash cache + lib-source cache; a fast path that re-bundles only when
-   imports change is a later refinement.
+   imports change is a later refinement. The Tailwind compiler runs inside the
+   iframe (own thread per frame), so it doesn't add to the plugin-renderer cost.
 3. **`creator-libs/` is ~16 MB in git** — a one-time cost; `.gitignore` does not
    exclude it; updating a lib (esbuild, CodeMirror, a React lib) re-vendors one
    file. The offline bundle step (esbuild bundling CodeMirror + the lib set into
