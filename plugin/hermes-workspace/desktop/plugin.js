@@ -678,7 +678,9 @@ function openApproval(next) {
       id: 'memory-approval',
       area: PANES_AREA,
       title: 'Memory approval',
-      data: { placement: 'right', width: '420px' },
+      // dock: a bare placement:'right' pane stacks into the collapsed `review`
+      // zone (Task 13) — anchor it beside the workspace like the Knowledge pane.
+      data: { placement: 'right', width: '420px', dock: { pane: 'workspace', pos: 'right' } },
       render: () => jsx(ApprovalPane, {}),
     })
   }
@@ -714,13 +716,16 @@ async function callModelAndParse(instructions, input, sid) {
 }
 
 async function runExtraction() {
-  const sid = sessionId()
+  if (approval$.get().phase === 'loading') return // in-flight: no double pipeline / double llm.oneshot
+  const sid = sessionId() // stored-first — stable key for resolve/dedup/journal
+  // Runtime id: session.history and llm.oneshot resolve against the gateway's
+  // live _sessions; a stored key there makes llm.oneshot fall back to the aux
+  // model instead of the model the user is chatting with.
+  const runtimeSid = host.state.focusedSessionId.get() || host.state.activeSessionId.get() || ''
   openApproval({ phase: 'loading' })
   let messages
   try {
-    const r = await host.request('session.history', {
-      session_id: host.state.focusedSessionId.get() || host.state.activeSessionId.get() || sid,
-    })
+    const r = await host.request('session.history', { session_id: runtimeSid })
     messages = (r && r.messages) || []
   } catch (e) {
     if (MISSING_RPC.test(String((e && e.message) || e))) {
@@ -734,12 +739,12 @@ async function runExtraction() {
   }
   try {
     const prep = await api('/extract/prepare', { method: 'POST', body: { messages } })
-    let parsed = await callModelAndParse(prep.prompt, prep.transcript_text, sid)
+    let parsed = await callModelAndParse(prep.prompt, prep.transcript_text, runtimeSid)
     if (parsed.error === 'model_output_unparseable') {
       parsed = await callModelAndParse(
         prep.prompt + '\n\nYour previous reply was not valid JSON. Return only the JSON object.',
         prep.transcript_text,
-        sid,
+        runtimeSid,
       )
     }
     if (parsed.error) {
