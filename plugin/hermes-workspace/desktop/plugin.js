@@ -10,7 +10,10 @@
 import {
   atom,
   Button,
+  COMPOSER_AREAS,
   EmptyState,
+  host,
+  PALETTE_AREA,
   SegmentedControl,
   StatusDot,
   Streamdown,
@@ -18,7 +21,7 @@ import {
   STATUSBAR_AREAS,
   useValue,
 } from '@hermes/plugin-sdk'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'hermes-workspace'
@@ -37,7 +40,7 @@ const qs = (obj) =>
 
 // Pane-local view state — one pane instance, module scope is fine. Kept out of
 // component state so it survives the view swap (Reader replaces SearchView).
-const view$ = atom('search') // 'search' | 'browse' | 'reader'
+const view$ = atom('search') // 'search' | 'browse' | 'reader' | 'injection'
 const openNote$ = atom(null) // vault-relative path
 const backView$ = atom('search') // where Reader's back control returns
 const query$ = atom('') // search box text
@@ -51,6 +54,244 @@ function openReader(path, from) {
   backView$.set(from)
   openNote$.set(path)
   view$.set('reader')
+}
+
+// ── Vault context: composer toggle + send-time middleware + preview strip ────
+// The middleware handler is handed the live draft by core. There is no SDK
+// draft atom, so the pre-send strip reads the composer's contentEditable text
+// from the DOM. ponytail: the DOM read is the only hook the SDK leaves open —
+// it degrades to rendering nothing if the composer markup ever changes.
+
+const vaultOn$ = atom(false) // mirrors ctx.storage 'vaultContext.on'
+const lastInjection$ = atom(null) // mirrors ctx.storage 'lastInjection'
+const sessionExcludes = new Set() // note paths the user ✕'d, this window only
+
+function setVaultOn(v) {
+  vaultOn$.set(!!v)
+  try {
+    CTX.storage.set('vaultContext.on', !!v)
+  } catch {}
+}
+
+const withTimeout = (p, ms) =>
+  Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))])
+
+// Shared by the middleware and the preview strip. 1.5s ceiling; excludes applied.
+async function contextFor(query) {
+  const res = await withTimeout(
+    api('/context', { method: 'POST', body: { query, budget_tokens: 1500, k_max: 6 } }),
+    1500,
+  )
+  const notes = ((res && res.notes) || []).filter((n) => !sessionExcludes.has(n.path))
+  return { block: (res && res.block) || '', total_tokens: (res && res.total_tokens) || 0, notes }
+}
+
+const composerMiddleware = {
+  // Fail-open by contract: never throw, never return null/undefined. A hanging
+  // or throwing injector must not block or cancel the send.
+  handler: async (draft) => {
+    try {
+      if (!vaultOn$.get()) return draft
+      const q = (draft.text || '').trim()
+      if (q.length < 12) return draft
+
+      let res
+      try {
+        res = await contextFor(q.slice(0, 500))
+      } catch {
+        host.notify({ kind: 'info', message: 'Vault context skipped (backend timeout)' })
+        return draft
+      }
+      if (!res.notes.length || !res.block) return draft
+
+      const injection = {
+        ts: Date.now(),
+        query: q,
+        notes: res.notes.map((n) => n.path),
+        block: res.block,
+      }
+      lastInjection$.set(injection)
+      try {
+        CTX.storage.set('lastInjection', injection)
+      } catch {}
+
+      return { ...draft, text: res.block + '\n\n' + draft.text }
+    } catch {
+      return draft
+    }
+  },
+}
+
+function TogglePill() {
+  const on = useValue(vaultOn$)
+  return jsx(Button, {
+    size: 'sm',
+    variant: on ? 'default' : 'ghost',
+    onClick: () => setVaultOn(!on),
+    title: 'Prepend relevant vault notes to your next message',
+    children: on ? 'Vault context: on' : 'Vault context: off',
+  })
+}
+
+const stripLinkStyle = {
+  background: 'none',
+  border: 'none',
+  padding: 0,
+  marginLeft: 8,
+  font: 'inherit',
+  color: 'inherit',
+  opacity: 0.75,
+  cursor: 'pointer',
+  textDecoration: 'underline',
+}
+
+function PreviewStrip() {
+  const on = useValue(vaultOn$)
+  const anchorRef = useRef(null)
+  const [info, setInfo] = useState(null)
+
+  useEffect(() => {
+    if (!on) {
+      setInfo(null)
+      return
+    }
+    let live = true
+    let lastText = null
+    let lastQuery = null
+    let settle = null
+
+    const readDraft = () => {
+      const root = anchorRef.current && anchorRef.current.closest('[data-slot="composer-root"]')
+      const box = root && root.querySelector('[role="textbox"]')
+      return box ? (box.textContent || '').trim() : ''
+    }
+
+    const tick = () => {
+      const text = readDraft()
+      if (text === lastText) return
+      lastText = text
+      if (settle) clearTimeout(settle)
+      settle = setTimeout(() => {
+        if (!text || text.length < 12) {
+          lastQuery = null
+          setInfo(null)
+          return
+        }
+        const q = text.slice(0, 500)
+        if (q === lastQuery) return
+        lastQuery = q
+        contextFor(q)
+          .then((r) => live && setInfo(r))
+          .catch(() => live && setInfo(null))
+      }, 400)
+    }
+
+    tick()
+    const id = setInterval(tick, 350)
+    return () => {
+      live = false
+      clearInterval(id)
+      if (settle) clearTimeout(settle)
+    }
+  }, [on])
+
+  if (!on) return null
+
+  return jsx('div', {
+    ref: anchorRef,
+    style: { fontSize: 11, opacity: 0.8, padding: info && info.notes.length ? '2px 10px 4px' : 0 },
+    children:
+      info && info.notes.length
+        ? jsxs('div', {
+            children: [
+              `vault context: ${info.notes.length} note${info.notes.length === 1 ? '' : 's'}`,
+              info.notes.map((n) =>
+                jsx(
+                  'button',
+                  {
+                    type: 'button',
+                    onClick: () => {
+                      sessionExcludes.add(n.path)
+                      setInfo((cur) =>
+                        cur ? { ...cur, notes: cur.notes.filter((x) => x.path !== n.path) } : cur,
+                      )
+                    },
+                    style: stripLinkStyle,
+                    title: `Exclude ${n.path}`,
+                    children: `✕ ${n.path.split('/').pop()}`,
+                  },
+                  n.path,
+                ),
+              ),
+              jsx(
+                'button',
+                { type: 'button', onClick: () => setVaultOn(false), style: stripLinkStyle, children: 'off' },
+                '__off',
+              ),
+            ],
+          })
+        : null,
+  })
+}
+
+function InjectionView() {
+  const last = useValue(lastInjection$)
+  if (!last) {
+    return jsx('div', {
+      style: { padding: 12, fontSize: 12, opacity: 0.6 },
+      children: 'No vault context has been injected yet.',
+    })
+  }
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', gap: 8, alignItems: 'center', padding: 6, flexWrap: 'wrap' },
+        children: [
+          jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => view$.set('search'), children: '‹ Back' }),
+          jsx(Button, {
+            size: 'xs',
+            variant: 'ghost',
+            onClick: () => CTX.os.writeClipboard(last.block),
+            children: 'Copy block',
+          }),
+        ],
+      }),
+      jsxs('div', {
+        style: { padding: '0 10px', fontSize: 11, opacity: 0.6 },
+        children: [
+          new Date(last.ts).toLocaleString(),
+          ' · ',
+          `${last.notes.length} note${last.notes.length === 1 ? '' : 's'}`,
+        ],
+      }),
+      jsx('div', {
+        title: last.query,
+        style: {
+          padding: '2px 10px 6px',
+          fontSize: 12,
+          fontWeight: 600,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        },
+        children: last.query,
+      }),
+      jsx('div', {
+        style: { overflow: 'auto', flex: 1, minHeight: 0, padding: '0 10px 16px' },
+        children: jsx('pre', {
+          style: {
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            fontSize: 12,
+            margin: 0,
+            fontFamily: 'inherit',
+          },
+          children: last.block,
+        }),
+      }),
+    ],
+  })
 }
 
 // The FTS snippet wraps matches in <b>…</b>. Render it as text nodes (any other
@@ -329,19 +570,33 @@ function KnowledgePane() {
             style: { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 },
             children: [
               view !== 'reader' &&
-                jsx('div', {
-                  style: { padding: '6px 8px' },
-                  children: jsx(SegmentedControl, {
-                    options: VIEW_OPTIONS,
-                    value: view === 'browse' ? 'browse' : 'search',
-                    onChange: (v) => view$.set(v),
-                  }),
+                jsxs('div', {
+                  style: { padding: '6px 8px', display: 'flex', gap: 6, alignItems: 'center' },
+                  children: [
+                    jsx('div', {
+                      style: { flex: 1, minWidth: 0 },
+                      children: jsx(SegmentedControl, {
+                        options: VIEW_OPTIONS,
+                        value: view === 'browse' ? 'browse' : 'search',
+                        onChange: (v) => view$.set(v),
+                      }),
+                    }),
+                    jsx(Button, {
+                      size: 'xs',
+                      variant: view === 'injection' ? 'default' : 'ghost',
+                      onClick: () => view$.set(view === 'injection' ? 'search' : 'injection'),
+                      title: 'Last vault-context injection',
+                      children: 'Injection',
+                    }),
+                  ],
                 }),
               view === 'reader'
                 ? jsx(ReaderView, {})
-                : view === 'browse'
-                  ? jsx(BrowseView, {})
-                  : jsx(SearchView, {}),
+                : view === 'injection'
+                  ? jsx(InjectionView, {})
+                  : view === 'browse'
+                    ? jsx(BrowseView, {})
+                    : jsx(SearchView, {}),
             ],
           }),
     ],
@@ -368,6 +623,13 @@ export default {
   register(ctx) {
     CTX = ctx
 
+    try {
+      vaultOn$.set(!!ctx.storage.get('vaultContext.on', false))
+    } catch {}
+    try {
+      lastInjection$.set(ctx.storage.get('lastInjection', null) || null)
+    } catch {}
+
     ctx.registerMany([
       {
         // Standing right-side chrome (~360px). hideOnly: no dismiss-without-
@@ -393,6 +655,34 @@ export default {
         area: STATUSBAR_AREAS.right,
         order: 70,
         render: () => jsx(KnowledgeStatusItem, {}),
+      },
+      {
+        id: 'composer-toggle',
+        area: COMPOSER_AREAS.leading,
+        render: () => jsx(TogglePill, {}),
+      },
+      {
+        id: 'composer-strip',
+        area: COMPOSER_AREAS.top,
+        render: () => jsx(PreviewStrip, {}),
+      },
+      {
+        id: 'composer-middleware',
+        area: COMPOSER_AREAS.middleware,
+        data: composerMiddleware,
+      },
+      {
+        id: 'palette-toggle',
+        area: PALETTE_AREA,
+        data: {
+          id: 'hermes-workspace.toggle-vault-context',
+          label: 'Toggle vault context',
+          keywords: ['vault', 'context', 'knowledge', 'obsidian', 'composer'],
+          detail: () => (vaultOn$.get() ? 'on' : 'off'),
+          detailVariant: 'state',
+          keepOpen: true,
+          run: () => setVaultOn(!vaultOn$.get()),
+        },
       },
     ])
   },
