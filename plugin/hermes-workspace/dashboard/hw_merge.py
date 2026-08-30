@@ -315,6 +315,9 @@ def atomic_write(abspath: str, new_text: str, pre_sha: str | None) -> dict:
             cur = open(abspath, "rb").read()
         except OSError as e:
             return {"status": "error", "detail": str(e), "sha_after": None}
+        if pre_sha is not None and sha256(_lf(cur)) != pre_sha:
+            return {"status": "conflict", "detail": "file changed since preview",
+                    "sha_after": None}
         try:
             cur.decode("utf-8")
         except UnicodeDecodeError:
@@ -323,14 +326,12 @@ def atomic_write(abspath: str, new_text: str, pre_sha: str | None) -> dict:
             except UnicodeDecodeError:
                 return {"status": "error", "detail": "not UTF-8, edit manually",
                         "sha_after": None}
-        if pre_sha is not None and sha256(_lf(cur)) != pre_sha:
-            return {"status": "conflict", "detail": "file changed since preview",
-                    "sha_after": None}
         eol = "\r\n" if b"\r\n" in cur else "\n"
         bom = _BOM if cur.startswith(_BOM) else b""
 
     payload = new_text.replace("\r\n", "\n").replace("\r", "\n")
-    payload = payload.lstrip("﻿")
+    if payload.startswith("\ufeff"):
+        payload = payload[1:]
     sha_after = sha256(bom + payload.encode("utf-8"))
     disk = payload.replace("\n", "\r\n") if eol == "\r\n" else payload
     data = bom + disk.encode("utf-8")
@@ -363,7 +364,8 @@ def _backup_dir():
 def backup(abspath: str) -> None:
     """Copy abspath to data_dir/backups/<vault_hash>/<relpath>.<stamp>.bak.
 
-    Keeps the last 20 backups per relpath; prunes any .bak older than 30 days.
+    Keeps the last 20 backups per relpath; prunes any .bak whose filename
+    stamp is older than 30 days.
     """
     vp = hw_store.vault_path()
     rel = os.path.relpath(abspath, str(vp)).replace(os.sep, "/")
@@ -374,13 +376,20 @@ def backup(abspath: str) -> None:
     shutil.copy2(abspath, dest_dir / f"{name}.{stamp}.bak")
     for old in sorted(dest_dir.glob(f"{name}.*.bak"))[:-20]:
         _safe_unlink(str(old))
-    cutoff = time.time() - 30 * 86400
+    # prune by the stamp in the filename, NOT st_mtime -- copy2 copies the source
+    # note's mtime onto the .bak, so an mtime prune would nuke a fresh backup of
+    # any note last edited >30 days ago (i.e. most of them).
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=30)
     for f in _backup_dir().rglob("*.bak"):
+        m = re.search(r"\.(\d{8}-\d{6})\.bak$", f.name)
+        if not m:
+            continue
         try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink()
-        except OSError:
-            pass
+            when = datetime.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
+        except ValueError:
+            continue
+        if when < cutoff:
+            _safe_unlink(str(f))
 
 
 def _journal_path():
@@ -432,43 +441,54 @@ def undo(batch_id: str | None) -> list[dict]:
     if batch_id is None:
         batch = log[-1]
     else:
-        batch = next((b for b in reversed(log) if b["batch_id"] == batch_id), None)
+        batch = next((b for b in reversed(log) if b.get("batch_id") == batch_id), None)
     if batch is None:
         return []
 
     vp = hw_store.vault_path()
-    restored_paths: set[str] = set()
+    restored: set[str] = set()  # paths already reverted whole from a .bak
     results: list[dict] = []
-    for it in batch["items"]:
-        relp = it["path"]
+    for it in batch.get("items", []):
+        relp = it.get("path")
+        line = it.get("line", "")
+        if not relp:
+            continue
         abspath = str(vp / relp)
-        if relp not in restored_paths:
-            restored_paths.add(relp)
-            bdir = _backup_dir() / os.path.dirname(relp)
-            baks = sorted(bdir.glob(f"{os.path.basename(relp)}.*.bak"))
-            if baks:
-                os.replace(str(baks[-1]), abspath)
+        if relp in restored:  # an earlier item already restored the whole note
+            results.append({"path": relp, "result": "restored"})
+            continue
+        bdir = _backup_dir() / os.path.dirname(relp)
+        baks = sorted(bdir.glob(f"{os.path.basename(relp)}.*.bak"))
+        if baks:
+            try:
+                # shutil.move (not os.replace): backups live under HERMES_HOME,
+                # the vault may be on another drive -> os.replace can't cross it.
+                shutil.move(str(baks[-1]), abspath)
+                restored.add(relp)
                 results.append({"path": relp, "result": "restored"})
                 continue
+            except OSError:
+                pass  # fall through to line removal
         try:
             raw = open(abspath, "rb").read()
         except OSError:
             results.append({"path": relp, "result": "skipped",
-                            "detail": "unreadable", "line": it["line"]})
+                            "detail": "unreadable", "line": line})
             continue
+        marker = line + "\n"
         text = _lf(raw).decode("utf-8", "replace")
-        marker = it["line"] + "\n"
-        if sha256(_lf(raw)) == it["sha_after"] and marker in text:
-            new = text.replace(marker, "", 1)
-            eol = "\r\n" if b"\r\n" in raw else "\n"
-            out = new.replace("\n", "\r\n") if eol == "\r\n" else new
-            with open(abspath, "wb") as f:
-                f.write(out.encode("utf-8"))
-            results.append({"path": relp, "result": "removed"})
+        if sha256(_lf(raw)) == it.get("sha_after") and marker in text:
+            # hash verified -> reuse atomic_write for the atomic, EOL/BOM-safe rewrite
+            r = atomic_write(abspath, text.replace(marker, "", 1), it.get("sha_after"))
+            if r["status"] == "written":
+                results.append({"path": relp, "result": "removed"})
+            else:
+                results.append({"path": relp, "result": "skipped",
+                                "detail": r["detail"], "line": line})
         else:
             results.append({"path": relp, "result": "skipped",
                             "detail": "changed since write; remove manually",
-                            "line": it["line"]})
+                            "line": line})
 
     if batch_id is None:
         log.pop()
@@ -499,8 +519,17 @@ def _selfcheck_write() -> None:
             pre = sha256(pathlib.Path(p).read_text("utf-8").encode("utf-8"))
 
             backup(p)
-            assert list((hw_store.data_dir() / "backups" / hw_store.vault_hash()
-                         / "Areas").glob("*.bak")), "backup .bak missing"
+            bak_dir = hw_store.data_dir() / "backups" / hw_store.vault_hash() / "Areas"
+            assert list(bak_dir.glob("X.md.*.bak")), "backup .bak missing"
+
+            # a note last touched >30 days ago must still get a durable backup
+            # (copy2 stamps the .bak with the note's mtime -> an mtime prune kills it)
+            old_note = os.path.join(vault, "Areas", "Old.md")
+            open(old_note, "wb").write(b"# Old\n\nstale.\n")
+            long_ago = time.time() - 40 * 86400
+            os.utime(old_note, (long_ago, long_ago))
+            backup(old_note)
+            assert list(bak_dir.glob("Old.md.*.bak")), "backup of >30d-old note was pruned"
 
             before = pathlib.Path(p).read_text("utf-8")  # LF-normalized
             new_text = before.replace(
@@ -550,6 +579,20 @@ def _selfcheck_write() -> None:
             finally:
                 os.chmod(ro, stat.S_IWRITE | stat.S_IREAD)
 
+            # BOM + CRLF fixture: BOM preserved, sha_after on the plain-utf-8 basis
+            bp = os.path.join(vault, "Areas", "Bom.md")
+            open(bp, "wb").write(
+                "\ufeff# T\r\n\r\n## History\r\n\r\n- **2026-08-01** — a.\r\n".encode("utf-8"))
+            bpre = sha256(pathlib.Path(bp).read_text("utf-8").encode("utf-8"))
+            bbefore = pathlib.Path(bp).read_text("utf-8")
+            br = atomic_write(bp, bbefore.replace("— a.\n", "— a.\n- **2026-08-30** — b.\n"), bpre)
+            assert br["status"] == "written", br
+            braw = open(bp, "rb").read()
+            assert braw.startswith(b"\xef\xbb\xbf") and braw.count(b"\xef\xbb\xbf") == 1, "BOM"
+            assert b"\r\n" in braw, "BOM fixture EOL"
+            assert br["sha_after"] == sha256(
+                pathlib.Path(bp).read_text("utf-8").encode("utf-8")), "BOM sha_after basis"
+
             # journal + dedupe
             journal_append("batch-1", [{"path": "Areas/X.md", "sha_before": pre,
                                         "sha_after": r["sha_after"],
@@ -558,11 +601,30 @@ def _selfcheck_write() -> None:
             assert journal_seen("s1", 0) and not journal_seen("s1", 1)
             assert _read_journal()[-1]["batch_id"] == "batch-1"
 
-            # undo: restore from .bak OR strip the exact line; added line is gone
+            # undo with a .bak present -> whole-note restore
             res = undo("batch-1")
-            assert res and res[0]["result"] in ("restored", "removed"), res
+            assert res and res[0]["result"] == "restored", res
             assert "- **2026-08-30** — b." not in pathlib.Path(p).read_text("utf-8")
+            assert b"\r\n" in open(p, "rb").read(), "restore lost CRLF"
             assert _read_journal() == []
+
+            # undo with NO .bak -> exact-line removal via atomic_write
+            for stale in bak_dir.glob("X.md.*.bak"):
+                stale.unlink()
+            r2 = atomic_write(p, pathlib.Path(p).read_text("utf-8").replace(
+                "— a.\n", "— a.\n- **2026-08-31** — c.\n"),
+                sha256(pathlib.Path(p).read_text("utf-8").encode("utf-8")))
+            assert r2["status"] == "written"
+            journal_append("batch-2", [{"path": "Areas/X.md",
+                                        "sha_after": r2["sha_after"],
+                                        "line": "- **2026-08-31** — c.",
+                                        "source_session_id": "s2", "candidate_index": 0}])
+            res2 = undo("batch-2")
+            assert res2 and res2[0]["result"] == "removed", res2
+            final = pathlib.Path(p).read_text("utf-8")
+            assert "- **2026-08-31** — c." not in final
+            assert "- **2026-08-01** — a." in final and final.endswith("\n"), final
+            assert b"\r\n" in open(p, "rb").read(), "line-removal lost CRLF"
     finally:
         hw_store._cache = None
         if saved_home is None:
