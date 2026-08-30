@@ -222,6 +222,7 @@ def _selfcheck() -> None:
             os.environ["HERMES_HOME"] = saved_home
     _selfcheck_render()
     _selfcheck_write()
+    _selfcheck_dedup()
 
 
 def _selfcheck_render() -> None:
@@ -626,6 +627,89 @@ def _selfcheck_write() -> None:
             assert "- **2026-08-01** — a." in final and final.endswith("\n"), final
             assert b"\r\n" in open(p, "rb").read(), "line-removal lost CRLF"
     finally:
+        hw_store._cache = None
+        if saved_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = saved_home
+
+
+# --- content-based dedup ----------------------------------------------------
+
+
+def _line_prose(line: str) -> str:
+    m = _LINE_RE.match(line.strip())
+    body = m.group(2) if m else line.lstrip("-").strip()
+    body = re.sub(r"\*\(supersedes:.*?\)\*", "", body)
+    return _norm(body)
+
+
+def dedup_entry(line, target_text, session_id, candidate_index, index, is_timeline=False):
+    if journal_seen(session_id, candidate_index):
+        return {"duplicate": True, "reason": "already_written",
+                "colliding_line": None, "warning": None}
+    want = _line_prose(line)
+    for existing in target_text.splitlines():
+        if not existing.lstrip().startswith(("-", "*")):
+            continue
+        if difflib.SequenceMatcher(None, want, _line_prose(existing)).ratio() >= 0.90:
+            return {"duplicate": True, "reason": "near_dup",
+                    "colliding_line": existing.strip(), "warning": None}
+    warning = None
+    if not is_timeline:
+        for hit in index.search(line, 3):
+            body = index._con.execute("SELECT body FROM notes WHERE path=?",
+                                      (hit["path"],)).fetchone()
+            if body and any(
+                difflib.SequenceMatcher(None, want, _line_prose(b)).ratio() >= 0.90
+                for b in body[0].splitlines() if b.lstrip().startswith(("-", "*"))):
+                warning = f"similar text already in {hit['path']}"
+                break
+    return {"duplicate": False, "reason": "new", "colliding_line": None, "warning": warning}
+
+
+def _selfcheck_dedup() -> None:
+    import tempfile
+    import hw_store
+    import hw_index
+
+    saved_home = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            hw_store._cache = None
+            vault = os.path.join(d, "vault")
+            os.makedirs(os.path.join(vault, "Areas"))
+            open(os.path.join(vault, "Areas", "X.md"), "w",
+                 encoding="utf-8").write("# X\nprose\n")
+            hw_store.set_vault(vault)
+            hw_index.reset_for_tests()
+            idx = hw_index.get_index()
+            idx.sync(full=True)
+
+            target = "## History\n\n- **2026-08-01** — the user prefers tabs over spaces.\n"
+
+            # exact normalized dup of an existing bullet -> near_dup, names the line
+            r = dedup_entry("- **2026-08-30** — The user prefers tabs over spaces.",
+                            target, "s9", 0, idx)
+            assert r["duplicate"] and r["reason"] == "near_dup"
+            assert r["colliding_line"] == "- **2026-08-01** — the user prefers tabs over spaces."
+
+            # a genuinely different statement -> new
+            r = dedup_entry("- **2026-08-30** — the user switched editors to Helix.",
+                            target, "s9", 1, idx)
+            assert not r["duplicate"] and r["reason"] == "new" and r["colliding_line"] is None
+
+            # (session_id, candidate_index) already in the journal -> already_written
+            journal_append("b", [{"path": "Areas/X.md", "sha_before": "", "sha_after": "",
+                                  "line": "x", "source_session_id": "s9",
+                                  "candidate_index": 2}])
+            r = dedup_entry("anything", target, "s9", 2, idx)
+            assert r["duplicate"] and r["reason"] == "already_written"
+            # a different index the journal has NOT seen still evaluates normally
+            assert dedup_entry("anything new", target, "s9", 3, idx)["reason"] == "new"
+    finally:
+        hw_index.reset_for_tests()
         hw_store._cache = None
         if saved_home is None:
             os.environ.pop("HERMES_HOME", None)
