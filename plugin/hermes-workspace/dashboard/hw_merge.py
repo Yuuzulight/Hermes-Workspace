@@ -111,8 +111,8 @@ def _is_fence(ln: str) -> bool:
     return ln.startswith("```") or ln.startswith("~~~")
 
 
-def _find_top_level_eof_insert(lines: list[str]) -> int:
-    """Insert index near EOF, before any trailing code fence / callout / `---` footer."""
+def _fence_map(lines: list[str]) -> list[bool]:
+    """True for every line inside (or opening/closing) a fenced code block."""
     inside, f = [], False
     for ln in lines:
         if _is_fence(ln):
@@ -120,51 +120,85 @@ def _find_top_level_eof_insert(lines: list[str]) -> int:
             f = not f
         else:
             inside.append(f)
+    return inside
+
+
+def _frontmatter_end(lines: list[str]) -> int:
+    """Index of the first body line past a leading YAML frontmatter block, else 0.
+
+    Same shape hw_notes._split_frontmatter recognises: a BOM-stripped text whose
+    first line is `---` and which has a later line starting with `---`. Nothing
+    may be spliced above that closing marker or the frontmatter is destroyed.
+    """
+    if not lines or lines[0].lstrip("\ufeff") != "---":
+        return 0
+    for i in range(1, len(lines)):
+        if lines[i].startswith("---"):
+            return i + 1
+    return 0
+
+
+def _find_top_level_eof_insert(lines: list[str], start: int = 0) -> int:
+    """Insert index near EOF, before any trailing code fence / callout / `---` footer.
+
+    `start` is the first line that may be written to (past any frontmatter).
+    """
+    inside = _fence_map(lines)
     # trailing `---` footer (rule + body text, no heading after it): insert before the rule
-    # ponytail: assumes no YAML frontmatter (system contract); a top `---\n...\n---` is not handled
     rule = None
-    for k in range(len(lines) - 1, -1, -1):
+    for k in range(len(lines) - 1, start - 1, -1):
         if _HEADING_RE.match(lines[k]):
             break
         if lines[k].strip() == "---" and not inside[k]:
             rule = k
             break
-    if rule is not None and rule > 0:
-        while rule > 0 and lines[rule - 1].strip() == "":
+    if rule is not None and rule > start:
+        while rule > start and lines[rule - 1].strip() == "":
             rule -= 1
         return rule
     i = len(lines)
-    while i > 0 and (lines[i - 1].strip() in ("", "---")
-                     or lines[i - 1].startswith(">") or inside[i - 1]):
+    while i > start and (lines[i - 1].strip() in ("", "---")
+                         or lines[i - 1].startswith(">") or inside[i - 1]):
         i -= 1
     return i
 
 
 def insert_history_line(text: str, line: str) -> tuple[str, bool]:
     lines = _lines(text)
+    inside = _fence_map(lines)
+    body = _frontmatter_end(lines)  # never splice at or above the closing `---`
     hist = None
-    for i, ln in enumerate(lines):
-        if _HEADING_RE.match(ln):
-            parts = ln.split(None, 1)
+    for i in range(body, len(lines)):
+        if _HEADING_RE.match(lines[i]) and not inside[i]:
+            parts = lines[i].split(None, 1)
             if len(parts) > 1 and parts[1].strip().lower() == "history":
                 hist = i
                 break
     if hist is None:
-        insert_at = _find_top_level_eof_insert(lines)
+        insert_at = _find_top_level_eof_insert(lines, body)
         block = ["", "## History", "", line]
         lines[insert_at:insert_at] = block
         return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), True
 
     end = len(lines)
     for j in range(hist + 1, len(lines)):
-        if _HEADING_RE.match(lines[j]):
+        if _HEADING_RE.match(lines[j]) and not inside[j]:
             end = j
             break
-    last_bullet = hist
+    last_bullet = None
     for j in range(hist + 1, end):
-        if lines[j].lstrip().startswith(("-", "*")):
+        if lines[j].lstrip().startswith(("-", "*")) and not inside[j]:
             last_bullet = j
-    lines.insert(last_bullet + 1, line)
+    if last_bullet is not None:
+        at = last_bullet + 1
+    else:
+        at = end
+        while at > hist + 1 and lines[at - 1].strip() == "":
+            at -= 1
+        if at == hist + 1:  # empty section: keep new_note_body's blank line
+            lines.insert(at, "")
+            at += 1
+    lines.insert(at, line)
     return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), False
 
 
@@ -264,6 +298,33 @@ def _selfcheck_render() -> None:
     t, _ = insert_history_line("# A\n\nbody\n\n---\n\nSee also [[X]]\n", "- **2026-08-30** — x.")
     assert t.index("- **2026-08-30** — x.") < t.index("---")
 
+    # YAML frontmatter, no heading, no `## History`: the closing `---` is the
+    # end of the frontmatter, NOT a footer rule -- splicing above it would leave
+    # the block unterminated and Obsidian would lose tags/aliases.
+    fm = "---\ntags: [x]\naliases: [y]\n---\n\nprose\n"
+    t, created = insert_history_line(fm, "- **2026-08-30** — x.")
+    assert created
+    assert t.startswith("---\ntags: [x]\naliases: [y]\n---\n"), t
+    assert t.index("---\ntags:") == 0 and t.count("\n---") == 1, t
+    assert t.index("## History") > t.index("aliases: [y]"), t
+    assert t.index("- **2026-08-30** — x.") > t.index("## History"), t
+    assert t.index("prose") < t.index("## History"), t
+
+    # frontmatter + an existing `## History`: append into it, frontmatter untouched
+    fm2 = "---\ntags: [x]\naliases: [y]\n---\n\n## History\n\n- **2026-08-01** — old.\n"
+    t, created = insert_history_line(fm2, "- **2026-08-30** — new.")
+    assert not created
+    assert t.startswith("---\ntags: [x]\naliases: [y]\n---\n"), t
+    assert t.index("- **2026-08-01** — old.") < t.index("- **2026-08-30** — new.")
+
+    # empty `## History` section gets new_note_body's blank line, not a tight append
+    t, _ = insert_history_line("# A\n\n## History\n", "- **2026-08-30** — x.")
+    assert t.endswith("## History\n\n- **2026-08-30** — x.\n"), t
+
+    # a `## History` inside a fenced block is not the section (top-level guard)
+    t, created = insert_history_line("# A\n\n```\n## History\n```\n", "- **2026-08-30** — x.")
+    assert created and t.index("- **2026-08-30** — x.") < t.index("```"), t
+
     tl = insert_timeline_line("# Timeline 2026\n\nintro\n\n- **2026-08-01** — old.\n",
                               "- **2026-08-30** — new.")
     assert tl.index("- **2026-08-30** — new.") < tl.index("- **2026-08-01** — old.")
@@ -327,7 +388,8 @@ def atomic_write(abspath: str, new_text: str, pre_sha: str | None) -> dict:
             except UnicodeDecodeError:
                 return {"status": "error", "detail": "not UTF-8, edit manually",
                         "sha_after": None}
-        eol = "\r\n" if b"\r\n" in cur else "\n"
+        # majority vote: one stray CRLF must not convert the whole file
+        eol = "\r\n" if cur.count(b"\r\n") * 2 > cur.count(b"\n") else "\n"
         bom = _BOM if cur.startswith(_BOM) else b""
 
     payload = new_text.replace("\r\n", "\n").replace("\r", "\n")
@@ -362,9 +424,11 @@ def _backup_dir():
     return hw_store.data_dir() / "backups" / hw_store.vault_hash()
 
 
-def backup(abspath: str) -> None:
+def backup(abspath: str) -> str:
     """Copy abspath to data_dir/backups/<vault_hash>/<relpath>.<stamp>.bak.
 
+    Returns the .bak path written -- the journal records it so undo restores
+    the backup its own batch made, not whatever is newest in the folder.
     Keeps the last 20 backups per relpath; prunes any .bak whose filename
     stamp is older than 30 days.
     """
@@ -374,7 +438,8 @@ def backup(abspath: str) -> None:
     dest_dir = _backup_dir() / os.path.dirname(rel)
     dest_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    shutil.copy2(abspath, dest_dir / f"{name}.{stamp}.bak")
+    dest = dest_dir / f"{name}.{stamp}.bak"
+    shutil.copy2(abspath, dest)
     for old in sorted(dest_dir.glob(f"{name}.*.bak"))[:-20]:
         _safe_unlink(str(old))
     # prune by the stamp in the filename, NOT st_mtime -- copy2 copies the source
@@ -391,6 +456,7 @@ def backup(abspath: str) -> None:
             continue
         if when < cutoff:
             _safe_unlink(str(f))
+    return str(dest)
 
 
 def _journal_path():
@@ -424,6 +490,24 @@ def journal_append(batch_id: str, items: list[dict]) -> None:
     _write_journal(log[-500:])
 
 
+def journal_replace(batch_id: str, items: list[dict]) -> None:
+    """Replace a batch's items (the pending entry -> the real sha_after/bak).
+
+    An empty `items` drops the batch: nothing of it survived the write pass.
+    """
+    log = _read_journal()
+    for b in reversed(log):
+        if b.get("batch_id") == batch_id:
+            if items:
+                b["items"] = items
+            else:
+                log.remove(b)
+            _write_journal(log)
+            return
+    if items:
+        journal_append(batch_id, items)
+
+
 def journal_seen(session_id: str, candidate_index: int) -> bool:
     for batch in _read_journal():
         for it in batch.get("items", []):
@@ -449,7 +533,9 @@ def undo(batch_id: str | None) -> list[dict]:
     vp = hw_store.vault_path()
     restored: set[str] = set()  # paths already reverted whole from a .bak
     results: list[dict] = []
-    for it in batch.get("items", []):
+    # last-written first: two items on one note unwind in the order they were
+    # applied, so each one's sha_after still describes the file when it is undone.
+    for it in reversed(batch.get("items", [])):
         relp = it.get("path")
         line = it.get("line", "")
         if not relp:
@@ -458,27 +544,37 @@ def undo(batch_id: str | None) -> list[dict]:
         if relp in restored:  # an earlier item already restored the whole note
             results.append({"path": relp, "result": "restored"})
             continue
-        bdir = _backup_dir() / os.path.dirname(relp)
-        baks = sorted(bdir.glob(f"{os.path.basename(relp)}.*.bak"))
-        if baks:
+        try:
+            raw = open(abspath, "rb").read()
+        except OSError:
+            raw = None
+        cur_sha = sha256(_lf(raw)) if raw is not None else None
+        bak = it.get("bak")
+        if "bak" not in it:  # journal written before backups were recorded
+            bdir = _backup_dir() / os.path.dirname(relp)
+            baks = sorted(bdir.glob(f"{os.path.basename(relp)}.*.bak"))
+            bak = str(baks[-1]) if baks else None
+        # Restore only when the note is byte-identical to what this batch wrote.
+        # Any later edit means the .bak predates the user's own work, and the
+        # move consumes it -- restoring would destroy that work irrecoverably.
+        if bak and cur_sha is not None and cur_sha == it.get("sha_after") \
+                and os.path.exists(bak):
             try:
                 # shutil.move (not os.replace): backups live under HERMES_HOME,
                 # the vault may be on another drive -> os.replace can't cross it.
-                shutil.move(str(baks[-1]), abspath)
+                shutil.move(bak, abspath)
                 restored.add(relp)
                 results.append({"path": relp, "result": "restored"})
                 continue
             except OSError:
                 pass  # fall through to line removal
-        try:
-            raw = open(abspath, "rb").read()
-        except OSError:
+        if raw is None:
             results.append({"path": relp, "result": "skipped",
                             "detail": "unreadable", "line": line})
             continue
         marker = line + "\n"
         text = _lf(raw).decode("utf-8", "replace")
-        if sha256(_lf(raw)) == it.get("sha_after") and marker in text:
+        if cur_sha == it.get("sha_after") and marker in text:
             # hash verified -> reuse atomic_write for the atomic, EOL/BOM-safe rewrite
             r = atomic_write(abspath, text.replace(marker, "", 1), it.get("sha_after"))
             if r["status"] == "written":
@@ -496,6 +592,7 @@ def undo(batch_id: str | None) -> list[dict]:
     else:
         log.remove(batch)
     _write_journal(log)
+    results.reverse()  # report in the order the items were written
     return results
 
 
@@ -626,6 +723,54 @@ def _selfcheck_write() -> None:
             assert "- **2026-08-31** — c." not in final
             assert "- **2026-08-01** — a." in final and final.endswith("\n"), final
             assert b"\r\n" in open(p, "rb").read(), "line-removal lost CRLF"
+
+            # undo must REFUSE when the note changed after the write: the .bak
+            # predates the user's edits and shutil.move would consume it.
+            q = os.path.join(vault, "Areas", "Q.md")
+            with open(q, "w", encoding="utf-8", newline="") as f:
+                f.write("# Q\n\n## History\n\n- **2026-08-01** — a.\n")
+            q_bak = backup(q)
+            assert q_bak and os.path.exists(q_bak), q_bak
+            qw = atomic_write(q, pathlib.Path(q).read_text("utf-8").replace(
+                "— a.\n", "— a.\n- **2026-08-30** — memory.\n"), None)
+            assert qw["status"] == "written", qw
+            journal_append("batch-3", [{"path": "Areas/Q.md", "sha_before": None,
+                                        "sha_after": qw["sha_after"], "bak": q_bak,
+                                        "line": "- **2026-08-30** — memory.",
+                                        "source_session_id": "s3", "candidate_index": 0}])
+            with open(q, "a", encoding="utf-8", newline="") as f:
+                f.write("\nHand-written paragraph.\n")
+            res3 = undo("batch-3")
+            assert res3 and res3[0]["result"] == "skipped", res3
+            qtext = pathlib.Path(q).read_text("utf-8")
+            assert "Hand-written paragraph." in qtext, "undo destroyed post-write edits"
+            assert "- **2026-08-30** — memory." in qtext, "undo removed a line it could not verify"
+            assert os.path.exists(q_bak), "a refused undo consumed the backup"
+
+            # clean case: nothing touched the note after the write -> byte-identical
+            u = os.path.join(vault, "Areas", "U.md")
+            with open(u, "w", encoding="utf-8", newline="") as f:
+                f.write("# U\n\n## History\n\n- **2026-08-01** — a.\n")
+            u_orig = open(u, "rb").read()
+            u_bak = backup(u)
+            uw = atomic_write(u, pathlib.Path(u).read_text("utf-8").replace(
+                "— a.\n", "— a.\n- **2026-08-30** — m.\n"), None)
+            journal_append("batch-4", [{"path": "Areas/U.md", "sha_before": None,
+                                        "sha_after": uw["sha_after"], "bak": u_bak,
+                                        "line": "- **2026-08-30** — m.",
+                                        "source_session_id": "s4", "candidate_index": 0}])
+            res4 = undo("batch-4")
+            assert res4 and res4[0]["result"] in ("restored", "removed"), res4
+            assert open(u, "rb").read() == u_orig, "clean undo is not byte-identical"
+
+            # EOL majority vote: one stray CRLF must not flip the file to CRLF.
+            # (the stray itself is normalised away -- new_text arrives LF-only)
+            mx = os.path.join(vault, "Areas", "Mixed.md")
+            open(mx, "wb").write(b"# M\r\n" + b"line\n" * 9)
+            mr = atomic_write(mx, pathlib.Path(mx).read_text("utf-8") + "tail\n", None)
+            assert mr["status"] == "written", mr
+            mraw = open(mx, "rb").read()
+            assert mraw.count(b"\r\n") == 0 and mraw.count(b"\n") == 11, mraw
     finally:
         hw_store._cache = None
         if saved_home is None:
