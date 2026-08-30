@@ -649,6 +649,8 @@ def dedup_entry(line, target_text, session_id, candidate_index, index, is_timeli
         return {"duplicate": True, "reason": "already_written",
                 "colliding_line": None, "warning": None}
     want = _line_prose(line)
+    if not want:
+        return {"duplicate": False, "reason": "new", "colliding_line": None, "warning": None}
     for existing in target_text.splitlines():
         if not existing.lstrip().startswith(("-", "*")):
             continue
@@ -657,7 +659,7 @@ def dedup_entry(line, target_text, session_id, candidate_index, index, is_timeli
                     "colliding_line": existing.strip(), "warning": None}
     warning = None
     if not is_timeline:
-        for hit in index.search(line, 3):
+        for hit in index.search(want, 3):
             body = index._con.execute("SELECT body FROM notes WHERE path=?",
                                       (hit["path"],)).fetchone()
             if body and any(
@@ -682,6 +684,8 @@ def _selfcheck_dedup() -> None:
             os.makedirs(os.path.join(vault, "Areas"))
             open(os.path.join(vault, "Areas", "X.md"), "w",
                  encoding="utf-8").write("# X\nprose\n")
+            open(os.path.join(vault, "Areas", "A.md"), "w", encoding="utf-8").write(
+                "# A\n\n## History\n\n- **2026-08-15** — The user deployed Argos to staging.\n")
             hw_store.set_vault(vault)
             hw_index.reset_for_tests()
             idx = hw_index.get_index()
@@ -699,6 +703,17 @@ def _selfcheck_dedup() -> None:
             r = dedup_entry("- **2026-08-30** — the user switched editors to Helix.",
                             target, "s9", 1, idx)
             assert not r["duplicate"] and r["reason"] == "new" and r["colliding_line"] is None
+
+            # cross-note: prose near-identical to a bullet in another note (NOT in
+            # target_text) -> not a dup, but warns and names that note
+            r = dedup_entry("- **2026-08-30** — the user deployed Argos to staging.",
+                            target, "s9", 10, idx)
+            assert r["duplicate"] is False and r["reason"] == "new"
+            assert r["warning"] and "Areas/A.md" in r["warning"]
+
+            # candidate that normalizes to empty prose -> new, never a spurious near_dup
+            r = dedup_entry("---", "## History\n\n---\n", "s9", 11, idx)
+            assert r["reason"] == "new" and r["colliding_line"] is None
 
             # (session_id, candidate_index) already in the journal -> already_written
             journal_append("b", [{"path": "Areas/X.md", "sha_before": "", "sha_after": "",
