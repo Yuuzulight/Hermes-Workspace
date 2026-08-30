@@ -214,6 +214,33 @@ def _selfcheck_http_write_edges() -> None:
             assert bad[0]["status"] == "error" and bad[0]["detail"] == "invalid path"
             assert not os.path.exists(os.path.join(d, "evil.md"))
             assert not os.path.exists(os.path.join(vault, "..", "evil.md"))
+
+            # a dedup blowup on one item (a locked note -> PermissionError) must
+            # not sink the batch: the item errors, the rest still commit.
+            real_dedup = hw_merge.dedup_entry
+
+            def _boom(line, *a, **k):
+                if "boom" in line:
+                    raise PermissionError("note is locked")
+                return real_dedup(line, *a, **k)
+
+            hw_merge.dedup_entry = _boom
+            try:
+                out = c.post("/memories/commit", json={"items": [
+                    {"target_path": "Areas/A.md", "history_line": "boom item.",
+                     "candidate_index": 30},
+                    {"target_path": "Areas/B.md", "history_line": "safe item.",
+                     "candidate_index": 31}], "source_session_id": "s4"}).json()
+                assert [r["status"] for r in out] == ["error", "written"], out
+                assert "locked" in out[0]["detail"], out
+                assert "safe item." in open(b, encoding="utf-8").read()
+                # same blowup through preview is guarded into a clean 500
+                pvr = c.post("/memories/preview", json={"items": [
+                    {"target_path": "Areas/A.md", "history_line": "boom in preview.",
+                     "candidate_index": 32}]})
+                assert pvr.status_code == 500, pvr.status_code
+            finally:
+                hw_merge.dedup_entry = real_dedup
     finally:
         hw_index.reset_for_tests()
         hw_store._cache = None

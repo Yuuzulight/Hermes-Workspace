@@ -128,6 +128,10 @@ class Index:
             return {"indexed": 0, "removed": 0, "took_ms": 0,
                     "error": "vault_not_found"}
         with self._lock:
+            # stale the debounce the instant a sync starts: a _maybe_sync racing
+            # this one now fails its check, blocks on the lock, and re-checks the
+            # fresh value on acquiring it instead of SELECTing mid-transaction.
+            self._last_scan_ns = 0
             t0 = time.time()
             self._indexing = True
             try:
@@ -305,6 +309,44 @@ def _selfcheck_incremental() -> None:
             reset_for_tests()
             idx = get_index()
             idx.sync(full=True)
+
+            # residual race: a sync in flight must stale the debounce so a
+            # _maybe_sync racing it blocks on the lock rather than reading the
+            # shared connection mid-transaction. Hold a sync open inside
+            # _index_one, fire _maybe_sync at it, and assert it reparsed nothing.
+            _started, _gate = threading.Event(), threading.Event()
+            _real_index_one = idx._index_one
+
+            def _slow_index_one(*a, **k):
+                _started.set()
+                _gate.wait(2)
+                return _real_index_one(*a, **k)
+
+            idx._index_one = _slow_index_one
+            _spy = []
+            _rp = hw_notes.parse_note
+            hw_notes.parse_note = lambda t, s: _spy.append(s) or _rp(t, s)
+            try:
+                open(a, "w", encoding="utf-8").write("# A\n\navocado\n")
+                os.utime(a, None)
+                idx._last_scan_ns = time.time_ns()  # fresh: _maybe_sync would skip
+                _t = threading.Thread(target=idx.sync)
+                _t.start()
+                _started.wait(2)
+                _staled = idx._last_scan_ns == 0
+                _m = threading.Thread(target=idx._maybe_sync)
+                _m.start()
+                _gate.set()
+                _t.join()
+                _m.join()
+                assert _staled, "sync() did not stale the debounce"
+            finally:
+                _gate.set()
+                idx._index_one = _real_index_one
+                hw_notes.parse_note = _rp
+            assert _spy == ["A"], _spy  # the racing _maybe_sync was a no-op
+            assert idx.search("avocado", 5)[0]["path"] == "Topics/A.md"
+            assert idx.search("banana", 5)[0]["path"] == "Topics/B.md"
 
             calls = []
             real = hw_notes.parse_note

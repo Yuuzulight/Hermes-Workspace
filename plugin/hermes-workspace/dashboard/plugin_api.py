@@ -251,8 +251,11 @@ def memories_preview(body: PreviewBody) -> list[dict]:
             hw_store.guard_path(item.target_path)
         except hw_store.PathError:
             raise HTTPException(status_code=400, detail="invalid path")
-        line, abspath, before, after, action, created = _plan(item)
-        dd = _dedup(item, line, before, body.source_session_id)
+        try:
+            line, abspath, before, after, action, created = _plan(item)
+            dd = _dedup(item, line, before, body.source_session_id)
+        except Exception as e:  # e.g. a note locked by Obsidian/AV -> PermissionError
+            raise HTTPException(status_code=500, detail=str(e))
         diff = "".join(difflib.unified_diff(
             before.splitlines(keepends=True), after.splitlines(keepends=True),
             item.target_path, item.target_path, n=3))
@@ -287,11 +290,11 @@ def memories_commit(body: PreviewBody) -> list[dict]:
             continue
         try:
             line, abspath, before, _after, _a, _c = _plan(item)
+            dd = _dedup(item, line, before, body.source_session_id)
         except Exception as e:
             results[i] = {"target_path": item.target_path, "status": "error",
                           "detail": str(e)}
             continue
-        dd = _dedup(item, line, before, body.source_session_id)
         if dd["reason"] in ("near_dup", "already_written"):
             results[i] = {"target_path": item.target_path, "status": "skipped",
                           "detail": dd["reason"]}
