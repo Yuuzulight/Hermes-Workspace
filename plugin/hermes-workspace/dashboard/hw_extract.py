@@ -100,27 +100,31 @@ def parse_model_output(raw: str) -> dict:
 def _clean(s: str) -> str:
     s = unicodedata.normalize("NFC", s)
     s = "".join(ch for ch in s if ch == "\n" or ord(ch) >= 32)
-    return re.sub(r"[ \t]+", " ", s).strip()
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def validate_candidate(c: dict) -> dict | None:
-    target = _clean(str(c.get("target", "")))
+    target = _clean(str(c.get("target", ""))).replace("\\", "/")
     hline = _clean(str(c.get("history_line", "")))
     supersedes = c.get("supersedes")
     supersedes = _clean(str(supersedes)) if supersedes else None
-    if not target or len(target) > 200 or ".." in target.split("/") or re.match(r"^[A-Za-z]:", target):
+    quote = _clean(str(c.get("quote", "")))[:200]
+    if (not target or len(target) > 200 or ".." in target.split("/")
+            or re.match(r"^[A-Za-z]:", target) or target.startswith("//")):
         return None
     if not (8 <= len(hline) <= 400):
         return None
     for field in (target, hline, supersedes or ""):
         if PROVIDER_DENY_RE.search(field) or SECRET_RE.search(field):
             return None
+    if PROVIDER_DENY_RE.search(quote) or SECRET_RE.search(quote):
+        quote = ""  # quote is verbatim transcript, not a stored field — blank it, keep the candidate
     if not _LINE_OK_RE.match(hline):
         m = re.match(r"^\s*-?\s*(?:\*\*(\d{4}-\d{2}-\d{2})\*\*\s*[—-]\s*)?(.*)$", hline)
         prose = (m.group(2) if m else hline).strip().rstrip(".") + "."
         date = m.group(1) if m and m.group(1) else None
         hline = f"- **{date}** — {prose}" if date else f"- {prose}"  # date fixed in render_line
-    return {"target": target, "history_line": hline, "supersedes": supersedes}
+    return {"target": target, "history_line": hline, "supersedes": supersedes, "quote": quote}
 
 
 def _selfcheck() -> None:
@@ -153,7 +157,28 @@ def _selfcheck() -> None:
     assert validate_candidate({"target": "../etc", "history_line": "- **2026-08-30** — x."}) is None
     v = validate_candidate({"target": "Topics/Foo.md", "history_line": "just prose no format"})
     assert v and v["history_line"].endswith(".")
-    assert "type" not in v and "quote" not in v
+    assert "type" not in v and v["quote"] == ""
+
+    good_line = "- **2026-08-30** — a valid line here."
+    # traversal / UNC via backslash (Windows)
+    assert validate_candidate({"target": "..\\..\\x", "history_line": good_line}) is None
+    assert validate_candidate({"target": "\\\\server\\share\\x", "history_line": good_line}) is None
+    assert validate_candidate({"target": "C:/x", "history_line": good_line}) is None
+    # SECRET_RE in history_line drops the whole candidate
+    assert validate_candidate({"target": "Profile.md",
+                               "history_line": "- **2026-08-30** — the token is sk-abcdefghij0123456789."}) is None
+    # quote kept when clean; blanked (candidate kept) when only the quote hits the denylist
+    vq = validate_candidate({"target": "Profile.md", "history_line": good_line, "quote": "x" * 300})
+    assert vq["quote"] == "x" * 200
+    vq2 = validate_candidate({"target": "Profile.md", "history_line": good_line,
+                              "quote": "the user said Claude is better"})
+    assert vq2 is not None and vq2["quote"] == ""
+    assert validate_candidate({"target": "Profile.md",
+                               "history_line": "- **2026-08-30** — Claude wrote this line."}) is None
+    # _clean collapses newlines to one line
+    assert "\n" not in validate_candidate(
+        {"target": "Profile.md", "history_line": "- **2026-08-30**\n— multi\nline."})["history_line"]
+
     assert build_prompt("- **2020-01-01** — old.").endswith("old.")
     assert "do NOT re-emit" in build_prompt("- **2020-01-01** — old.")
 
