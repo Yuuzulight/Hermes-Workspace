@@ -18,7 +18,7 @@ import {
   STATUSBAR_AREAS,
   useValue,
 } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'hermes-workspace'
@@ -35,10 +35,12 @@ const qs = (obj) =>
     .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
     .join('&')
 
-// Pane-local view state — one pane instance, module scope is fine.
+// Pane-local view state — one pane instance, module scope is fine. Kept out of
+// component state so it survives the view swap (Reader replaces SearchView).
 const view$ = atom('search') // 'search' | 'browse' | 'reader'
 const openNote$ = atom(null) // vault-relative path
 const backView$ = atom('search') // where Reader's back control returns
+const query$ = atom('') // search box text
 
 const VIEW_OPTIONS = [
   { id: 'search', label: 'Search' },
@@ -69,11 +71,16 @@ function excerptNodes(ex) {
 
 function useStatus() {
   const [st, setSt] = useState(null)
-  const load = () => api('/status').then(setSt).catch(() => {})
+  const load = useCallback(() => api('/status').then(setSt).catch(() => {}), [])
   useEffect(() => {
-    load()
-    const id = setInterval(load, 5000)
-    return () => clearInterval(id)
+    let live = true
+    const tick = () => api('/status').then((r) => live && setSt(r)).catch(() => {})
+    tick()
+    const id = setInterval(tick, 5000)
+    return () => {
+      live = false
+      clearInterval(id)
+    }
   }, [])
   return [st, load]
 }
@@ -136,7 +143,7 @@ function Header({ st, refreshStatus }) {
 }
 
 function SearchView() {
-  const [q, setQ] = useState('')
+  const q = useValue(query$)
   const [rows, setRows] = useState([])
   const [note, setNote] = useState('')
 
@@ -169,7 +176,7 @@ function SearchView() {
           value: q,
           autoFocus: true,
           placeholder: 'Search the vault…',
-          onChange: (e) => setQ(e.target.value),
+          onChange: (e) => query$.set(e.target.value),
           style: {
             width: '100%',
             boxSizing: 'border-box',
@@ -369,7 +376,16 @@ export default {
         id: 'pane',
         area: PANES_AREA,
         title: 'Knowledge',
-        data: { placement: 'right', width: '360px', hideOnly: true, collapsible: true },
+        // dock: a resolvable anchor (core `files`/`sessions` carry the same
+        // shape) so adoption opens a fresh visible zone beside the workspace
+        // instead of stacking into the collapsed `review` zone.
+        data: {
+          placement: 'right',
+          width: '360px',
+          hideOnly: true,
+          collapsible: true,
+          dock: { pane: 'workspace', pos: 'right' },
+        },
         render: () => jsx(KnowledgePane, {}),
       },
       {
