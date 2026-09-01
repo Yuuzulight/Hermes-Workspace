@@ -1090,6 +1090,10 @@ def find_windows_gateway_services(
                 # it cannot still supervise a live gateway tree.
                 continue
             except Exception as exc:
+                # If the service is in an indeterminate state (e.g., stop_pending),
+                # skip it gracefully instead of failing the entire enumeration.
+                if "indeterminate" in str(exc).lower() or "stop_pending" in str(exc):
+                    continue
                 raise RuntimeError("SCM service inspection failed") from exc
             if not service_name:
                 raise RuntimeError("SCM service has an empty name")
