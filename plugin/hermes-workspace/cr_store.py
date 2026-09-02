@@ -7,6 +7,27 @@ def normalize(content: str) -> str:
     return content.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
 
 
+def sanitize_identifier(raw: str) -> str:
+    """Sanitize a raw identifier per spec §5.1: lowercase, [a-z0-9._-], collapse -,
+    strip leading/trailing -., reject .., no backslash, first char alnum, cap 64,
+    empty → "artifact"."""
+    # Lowercase and replace non-allowed chars with dash
+    s = re.sub(r"[^a-z0-9._-]+", "-", raw.lower())
+    # Collapse multiple dashes
+    s = re.sub(r"-{2,}", "-", s)
+    # Replace .. with dash to reject double dots
+    s = s.replace("..", "-")
+    # Strip leading/trailing dashes and dots
+    s = s.strip("-.")
+    # If first char is digit, prefix with 'a'
+    if s and s[0].isdigit():
+        s = "a" + s
+    # Cap at 64 chars
+    s = s[:64]
+    # Empty or all invalid → "artifact"
+    return s or "artifact"
+
+
 def _hermes_home() -> Path:
     try:
         from hermes_constants import get_hermes_home
@@ -100,6 +121,15 @@ def _selfcheck() -> None:
     finally:
         if saved is None: os.environ.pop("HERMES_HOME", None)
         else: os.environ["HERMES_HOME"] = saved
+
+    # Task 3: sanitize_identifier
+    assert sanitize_identifier("My Cool Widget!!") == "my-cool-widget"
+    assert sanitize_identifier("") == "artifact"
+    assert sanitize_identifier("...") == "artifact"
+    assert sanitize_identifier("../etc/passwd") == "artifact" or ".." not in sanitize_identifier("../etc/passwd")
+    assert sanitize_identifier("a" * 200) == "a" * 64
+    assert sanitize_identifier("---a---b---") == "a-b"
+    assert not sanitize_identifier("9lives")[0].isdigit()
 
 
 if __name__ == "__main__":
