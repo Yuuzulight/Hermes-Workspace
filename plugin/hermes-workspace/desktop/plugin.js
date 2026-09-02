@@ -1673,6 +1673,29 @@ try {
   )
 }
 
+// Standalone export (spec §7.2). Non-react types are wrapped server-side;
+// react is assembled here from the same crBundle/crTailwind pieces the live
+// preview (crReactBuild) uses, then persisted via the /export/bundle route.
+// crReactSrcdoc splices crBridgeScript (the postMessage bridge to the pane)
+// only when its `injectRuntime` param is truthy — confirmed by reading its
+// current body, it's still conditional, not spliced unconditionally. So
+// calling it here with no `nonce`/`injectRuntime` already yields a bridge-
+// free, fully standalone doc (theme prelude + css + bundle + the same
+// ErrorBoundary bootstrap the preview uses) — no separate assembly function
+// needed to satisfy "no compiler/bridge script".
+async function crExport(id, detail, source) {
+  if (detail && detail.type === 'react') {
+    const built = await crBundle(source)
+    if (!built.ok) return { ok: false, errors: built.errors }
+    const css = await crTailwind(built.code, null, source)
+    const html = await crReactSrcdoc({ bundle: built.code, css })
+    const r = await crApi(crPath(id, '/export/bundle'), { method: 'POST', body: { html } })
+    return { ok: true, path: r.path }
+  }
+  const r = await crApi(crPath(id, '/export'), { method: 'POST', body: {} })
+  return { ok: true, path: r.path }
+}
+
 function crB64(s) {
   const bytes = new TextEncoder().encode(String(s || ''))
   let bin = ''
@@ -1727,8 +1750,26 @@ function CrHeader() {
   const vv = useValue(crViewVersion$)
   const busy = useValue(crBusy$)
   const [confirm, setConfirm] = useState(false)
+  const [exportResult, setExportResult] = useState(null) // {path} | {errors} | null
   const count = (detail && detail.version_count) || 1
   const n = vv == null ? count : vv
+
+  const doExport = () => {
+    if (!open) return
+    setExportResult(null)
+    crBusy$.set(true)
+    crExport(open, detail, crContent$.get())
+      .then(setExportResult)
+      .catch((e) => host.notifyError?.(e, 'Export failed'))
+      .finally(() => crBusy$.set(false))
+  }
+  // Calls crCtx.os[method](path) — NOT a detached `crCtx.os.revealPath` reference,
+  // so `this` stays bound if the host implementation relies on it.
+  const tryOsAction = (method, path, label) => {
+    if (!crCtx.os[method](path)) {
+      host.notifyError?.(new Error(`${label} is not available here — copy the path instead.`), label)
+    }
+  }
 
   const step = (to) => {
     crDirty$.set(false)
@@ -1750,68 +1791,109 @@ function CrHeader() {
   }
 
   return jsxs('div', {
-    style: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 6,
-      padding: '6px 8px',
-      borderBottom: '1px solid rgba(128,128,128,0.2)',
-      flexWrap: 'wrap',
-    },
-    children: [
-      jsx('select', {
-        value: open || '',
-        onChange: (e) => crPick(e.target.value),
-        style: { flex: 1, minWidth: 120, maxWidth: 200, fontSize: 12, padding: '2px 4px' },
-        children: list.map((a) =>
-          jsx(
-            'option',
-            { value: a.identifier, children: `${a.in_session ? '● ' : ''}${a.title || a.identifier}` },
-            a.identifier,
+    style: { display: 'flex', flexDirection: 'column' },
+    children: [jsxs('div', {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '6px 8px',
+        borderBottom: '1px solid rgba(128,128,128,0.2)',
+        flexWrap: 'wrap',
+      },
+      children: [
+        jsx('select', {
+          value: open || '',
+          onChange: (e) => crPick(e.target.value),
+          style: { flex: 1, minWidth: 120, maxWidth: 200, fontSize: 12, padding: '2px 4px' },
+          children: list.map((a) =>
+            jsx(
+              'option',
+              { value: a.identifier, children: `${a.in_session ? '● ' : ''}${a.title || a.identifier}` },
+              a.identifier,
+            ),
           ),
-        ),
-      }),
-      jsx('button', {
-        onClick: () => step(n - 1),
-        disabled: n <= 1,
-        title: 'Older version',
-        style: { fontSize: 12, padding: '0 4px' },
-        children: '◀',
-      }),
-      jsx('span', { style: { fontSize: 11, opacity: 0.7 }, children: `v${n}/${count}` }),
-      jsx('button', {
-        onClick: () => step(n + 1),
-        disabled: n >= count,
-        title: 'Newer version',
-        style: { fontSize: 12, padding: '0 4px' },
-        children: '▶',
-      }),
-      n >= count
-        ? jsx('span', { style: { fontSize: 10, opacity: 0.5 }, children: 'latest' })
-        : jsx(Button, { size: 'xs', variant: 'ghost', disabled: busy, onClick: restore, children: '↺ restore' }),
-      jsx(CopyButton, { appearance: 'icon', text: () => crContent$.get(), title: 'Copy content' }),
-      jsx(Button, {
-        size: 'xs',
-        variant: 'ghost',
-        disabled: !open || busy,
-        onClick: () => setConfirm(true),
-        children: 'Delete',
-      }),
-      jsx(ConfirmDialog, {
-        open: confirm,
-        onClose: () => setConfirm(false),
-        destructive: true,
-        title: 'Delete this artifact?',
-        description: 'Every version and its files are removed. This cannot be undone.',
-        confirmLabel: 'Delete',
-        onConfirm: async () => {
-          if (!open) return
-          await crApi(crPath(open), { method: 'DELETE' })
-          crOpen$.set(null)
-          crPinned$.set(false)
-          await crPoll()
-        },
-      }),
+        }),
+        jsx('button', {
+          onClick: () => step(n - 1),
+          disabled: n <= 1,
+          title: 'Older version',
+          style: { fontSize: 12, padding: '0 4px' },
+          children: '◀',
+        }),
+        jsx('span', { style: { fontSize: 11, opacity: 0.7 }, children: `v${n}/${count}` }),
+        jsx('button', {
+          onClick: () => step(n + 1),
+          disabled: n >= count,
+          title: 'Newer version',
+          style: { fontSize: 12, padding: '0 4px' },
+          children: '▶',
+        }),
+        n >= count
+          ? jsx('span', { style: { fontSize: 10, opacity: 0.5 }, children: 'latest' })
+          : jsx(Button, { size: 'xs', variant: 'ghost', disabled: busy, onClick: restore, children: '↺ restore' }),
+        jsx(CopyButton, { appearance: 'icon', text: () => crContent$.get(), title: 'Copy content' }),
+        jsx(Button, {
+          size: 'xs',
+          variant: 'ghost',
+          disabled: !open || busy,
+          onClick: () => setConfirm(true),
+          children: 'Delete',
+        }),
+        jsx(ConfirmDialog, {
+          open: confirm,
+          onClose: () => setConfirm(false),
+          destructive: true,
+          title: 'Delete this artifact?',
+          description: 'Every version and its files are removed. This cannot be undone.',
+          confirmLabel: 'Delete',
+          onConfirm: async () => {
+            if (!open) return
+            await crApi(crPath(open), { method: 'DELETE' })
+            crOpen$.set(null)
+            crPinned$.set(false)
+            await crPoll()
+          },
+        }),
+        jsx(Button, { size: 'xs', variant: 'ghost', disabled: !open || busy, onClick: doExport, children: 'Export' }),
+      ],
+    }),
+    exportResult
+      ? jsxs('div', {
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '4px 8px',
+            borderBottom: '1px solid rgba(128,128,128,0.15)',
+            flexWrap: 'wrap',
+            fontSize: 11,
+          },
+          children: exportResult.errors
+            ? [
+                jsx('span', {
+                  style: { color: '#e5484d', whiteSpace: 'pre-wrap' },
+                  children: `Export failed: ${exportResult.errors}`,
+                }),
+              ]
+            : [
+                jsx('span', { style: { opacity: 0.7 }, children: `Exported: ${exportResult.path}` }),
+                jsx(CopyButton, { appearance: 'icon', text: () => exportResult.path, title: 'Copy path' }),
+                jsx(Button, {
+                  size: 'xs',
+                  variant: 'ghost',
+                  onClick: () => tryOsAction('revealPath', exportResult.path, 'Reveal in folder'),
+                  children: 'Reveal in folder',
+                }),
+                jsx(Button, {
+                  size: 'xs',
+                  variant: 'ghost',
+                  onClick: () => tryOsAction('openExternal', exportResult.path, 'Open in browser'),
+                  children: 'Open in browser',
+                }),
+              ],
+        })
+      : null,
     ],
   })
 }
