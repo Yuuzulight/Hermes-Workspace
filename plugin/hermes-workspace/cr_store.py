@@ -401,6 +401,101 @@ def do_read(args: dict) -> dict:
     return out
 
 
+class StoreGone(Exception):
+    """Raised when a version row exists but its backing file is missing (§5.10 → HTTP 410)."""
+
+
+def get_version(identifier, n) -> dict:
+    """One version's stored content (§5.10 `GET /v/{n}`). StoreNotFound if no row,
+    StoreGone if the row exists but the file is gone. Reads by the row's stored ext."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT a.dir, a.type, v.ext FROM versions v "
+            "JOIN artifacts a ON a.identifier = v.identifier "
+            "WHERE v.identifier = ? AND v.n = ?", (identifier, n)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise StoreNotFound(f"no version {n} of '{identifier}'")
+    dir_, type_, ext = row
+    p = _creator_dir() / dir_ / f"v{n}.{ext}"
+    if not p.exists():
+        raise StoreGone(f"v{n} of '{identifier}' is missing on disk")
+    return {"identifier": identifier, "n": n, "type": type_,
+            "content": p.read_text(encoding="utf-8")}
+
+
+def restore(identifier, n, session_id) -> dict:
+    """Restore v<n> as a new version (§5.10). StoreGone if the v<n> file is gone;
+    normalize-equal to latest → unchanged; else a new version, source='restore'."""
+    v = get_version(identifier, n)
+    cur = latest(identifier)
+    if cur and sha256_of(v["content"]) == cur["sha256"]:
+        record_session(identifier, session_id)
+        return {"action": "unchanged", "version": cur["version"]}
+    r = add_version(identifier, type_=cur["type"], title=cur["title"],
+                    language=cur["language"], content=v["content"], origin="tool",
+                    source="restore", session_id=session_id, restored_from=n)
+    return {"action": "restored", "version": r["version"]}
+
+
+def list_artifacts(session_id: str | None) -> list[dict]:
+    """Every artifact with its latest version (§5.10 `GET /artifacts`). In-session
+    artifacts first, then by `updated_at` desc. session_id=None → all in_session=False."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT a.identifier, a.type, a.title, "
+            "(SELECT MAX(n) FROM versions WHERE identifier = a.identifier), "
+            "a.updated_at, a.origin, "
+            "EXISTS(SELECT 1 FROM artifact_sessions s "
+            "       WHERE s.identifier = a.identifier AND s.session_id = ?) AS in_session "
+            "FROM artifacts a "
+            "ORDER BY in_session DESC, a.updated_at DESC", (session_id,)).fetchall()
+    finally:
+        conn.close()
+    return [{"identifier": r[0], "type": r[1], "title": r[2], "version": r[3],
+             "updated_at": r[4], "origin": r[5], "in_session": bool(r[6])}
+            for r in rows]
+
+
+def get_artifact(identifier) -> dict:
+    """Artifact metadata + its version list ascending by n (§5.10 `GET /artifacts/{id}`)."""
+    row = _meta(identifier)
+    if row is None:
+        raise StoreNotFound(f"no artifact '{identifier}' — call create_artifact first")
+    dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
+    conn = _connect()
+    try:
+        vs = conn.execute(
+            "SELECT n, source, restored_from, created_at, bytes FROM versions "
+            "WHERE identifier = ? ORDER BY n", (identifier,)).fetchall()
+    finally:
+        conn.close()
+    return {"identifier": identifier, "type": type_, "language": language,
+            "title": title, "version_count": vcount, "updated_at": updated_at,
+            "versions": [{"n": v[0], "source": v[1], "restored_from": v[2],
+                          "created_at": v[3], "bytes": v[4]} for v in vs]}
+
+
+def delete_artifact(identifier) -> None:
+    """Delete an artifact, its rows (FK cascade), and its directory (§5.10 `DELETE`)."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT dir FROM artifacts WHERE identifier = ?", (identifier,)).fetchone()
+        if row is None:
+            return
+        d = _creator_dir() / row[0]
+        base = _creator_dir()
+        assert os.path.realpath(d).startswith(os.path.realpath(base) + os.sep), d
+        conn.execute("DELETE FROM artifacts WHERE identifier = ?", (identifier,))
+    finally:
+        conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def _selfcheck() -> None:
     # skeleton assertions grow every task
     assert normalize("a\r\nb\n") == "a\nb"
@@ -499,6 +594,42 @@ def _selfcheck() -> None:
                     "WHERE identifier='doc' AND session_id='s-unchanged'").fetchone()[0] == 1
             finally:
                 conn.close()
+
+            # Task 7: get_version / restore / list_artifacts / get_artifact / delete_artifact
+            add_version("doc", type_="markdown", title="", language=None, content="v4 body",
+                        origin="tool", source="update", session_id="s1")
+            rr = restore("doc", 1, "s1")
+            assert rr["action"] == "restored" and rr["version"] == 5
+            assert get_version("doc", 5)["content"] == "# hi"
+            assert restore("doc", 5, "s1")["action"] == "unchanged"
+            lst = list_artifacts("s1")
+            assert any(a["identifier"] == "doc" and a["in_session"] for a in lst)
+            ga = get_artifact("doc")
+            assert ga["version_count"] == 5 and ga["versions"][-1]["source"] == "restore" \
+                and ga["versions"][-1]["restored_from"] == 1
+            # missing-file -> StoreGone
+            (_creator_dir() / ga["identifier"] if False else None)
+            import os as _os
+            _os.remove(_creator_dir() / list_artifacts(None)[0]["identifier"] / "v1.md") if False else None
+            delete_artifact("doc")
+            try:
+                get_artifact("doc"); assert False
+            except StoreNotFound: pass
+            assert not (_creator_dir() / "doc").exists()
+
+            # focused StoreGone: row exists, file gone
+            add_version("gone-t", type_="markdown", title="G", language=None,
+                        content="body", origin="tool", source="create", session_id="s1")
+            assert get_version("gone-t", 1)["content"] == "body"
+            os.remove(_creator_dir() / "gone-t" / "v1.md")
+            try:
+                get_version("gone-t", 1); assert False
+            except StoreGone: pass
+            try:
+                get_version("gone-t", 9); assert False
+            except StoreNotFound: pass
+            # session_id=None -> nothing in_session
+            assert all(not a["in_session"] for a in list_artifacts(None))
     finally:
         if saved is None: os.environ.pop("HERMES_HOME", None)
         else: os.environ["HERMES_HOME"] = saved
