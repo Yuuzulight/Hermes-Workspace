@@ -1,5 +1,5 @@
 """Creator store — all Creator behaviour. stdlib only; no relative imports."""
-import base64, difflib, hashlib, json, os, re, sqlite3, time
+import base64, difflib, hashlib, json, os, re, shutil, sqlite3, time
 from pathlib import Path
 
 
@@ -286,13 +286,15 @@ class StoreBadInput(Exception):
 
 
 def _meta(identifier):
-    """(dir, type, title, language, updated_at, version_count, max_n) or None."""
+    """(dir, type, title, language, updated_at, version_count, max_n, max_n_ext) or None."""
     conn = _connect()
     try:
         return conn.execute(
             "SELECT a.dir, a.type, a.title, a.language, a.updated_at, "
             "(SELECT COUNT(*) FROM versions WHERE identifier = a.identifier), "
-            "(SELECT MAX(n) FROM versions WHERE identifier = a.identifier) "
+            "(SELECT MAX(n) FROM versions WHERE identifier = a.identifier), "
+            "(SELECT ext FROM versions WHERE identifier = a.identifier "
+            " ORDER BY n DESC LIMIT 1) "
             "FROM artifacts a WHERE a.identifier = ?", (identifier,)).fetchone()
     finally:
         conn.close()
@@ -385,8 +387,8 @@ def do_read(args: dict) -> dict:
     row = _meta(ident)
     if row is None:
         raise StoreNotFound(f"no artifact '{ident}' — call create_artifact first")
-    dir_, type_, title, language, updated_at, vcount, maxn = row
-    text = (_creator_dir() / dir_ / f"v{maxn}.{ext_for(type_, language)}").read_text(
+    dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
+    text = (_creator_dir() / dir_ / f"v{maxn}.{maxn_ext}").read_text(
         encoding="utf-8")
     out = {"identifier": ident, "version": maxn, "type": type_, "title": title,
            "version_count": vcount, "updated_at": updated_at}
@@ -477,7 +479,7 @@ def _selfcheck() -> None:
             assert c["action"] == "created" and c["version"] == 1 and "content" not in c
             c2 = do_create({"identifier": "doc", "type": "code", "title": "Doc2", "content": "# hi\n\nmore"}, "s1")
             assert c2["action"] == "updated" and c2["type"] == "markdown"  # original type kept
-            u_same = do_update({"identifier": "doc", "content": "# hi\n\nmore\n"}, "s1")  # only trailing \n differs
+            u_same = do_update({"identifier": "doc", "content": "# hi\n\nmore\n"}, "s-unchanged")  # only trailing \n differs
             assert u_same["action"] == "unchanged"
             u = do_update({"identifier": "doc", "content": "# hi\n\nchanged"}, "s2")
             assert u["action"] == "updated" and "changed" in u["content"] and "@@" in u["diff"]
@@ -489,11 +491,12 @@ def _selfcheck() -> None:
             except StoreBadInput: pass
             r = do_read({"identifier": "doc"})
             assert r["version"] == 3 and r["content"] == "# hi\n\nchanged" and r["version_count"] == 3
-            # session recorded even on unchanged
+            # session recorded even on unchanged (fresh id, not touched by v1-v3 writes)
             conn = _connect()
             try:
                 assert conn.execute(
-                    "SELECT COUNT(*) FROM artifact_sessions WHERE identifier='doc'").fetchone()[0] == 2
+                    "SELECT COUNT(*) FROM artifact_sessions "
+                    "WHERE identifier='doc' AND session_id='s-unchanged'").fetchone()[0] == 1
             finally:
                 conn.close()
     finally:
