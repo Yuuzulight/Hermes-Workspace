@@ -559,6 +559,144 @@ def set_config(patch: dict) -> dict:
     return get_config()
 
 
+# ── Transcript scan (§5.9) ────────────────────────────────────────────────────
+
+NON_ARTIFACT_LANGS = frozenset({
+    "", "console", "diff", "log", "logs", "markdown", "md", "mermaid", "output",
+    "patch", "plain", "plaintext", "shell-session", "stdout", "text", "txt",
+})
+
+_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)\n?```", re.DOTALL)
+_DECL_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+    r"(?:def|class|function|const|let|var|type|interface|struct|fn|func|public|private)\s+"
+    r"([A-Za-z_$][\w$]*)", re.M)
+_TAG_RE = re.compile(r"<[a-zA-Z/][^>]*>")
+
+_SCAN_DEBOUNCE = 10.0
+_scan_seen: dict[str, float] = {}
+
+# SCAN_ROWS mirrors the §5.9 precedence table for readers / spec cross-ref;
+# _classify() below is its executable form (first matching row decides).
+SCAN_ROWS = (
+    ("svg",      "lang svg or body starts <svg",            2000, "chars"),
+    ("html",     "lang html/htm/xhtml or empty+doc wrapper", 160,  "chars"),
+    ("html",     "lang empty, tag-dense, no wrapper",        1200, "chars"),
+    ("mermaid",  "lang mermaid",                             0,    "any"),
+    ("markdown", "lang md/markdown",                         600,  "chars"),
+    ("code",     "other lang not in NON_ARTIFACT_LANGS",     48,   "lines or 3000 chars"),
+)
+
+
+def _read_assistant_messages(session_id: str) -> list[str]:
+    """Assistant message texts for a session — the monkeypatchable scan seam
+    (§5.9). Lazy-imports the host `SessionDB`; returns [] if it is unavailable."""
+    try:
+        from hermes_state import SessionDB
+    except Exception:
+        return []
+    try:
+        msgs = SessionDB().get_messages(session_id, include_compacted=True)
+    except Exception:
+        return []
+    out = []
+    for m in msgs:
+        if m.get("role") != "assistant":
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            out.append(" ".join(
+                b.get("text", "") for b in c if isinstance(b, dict)))
+        elif isinstance(c, str):
+            out.append(c)
+    return out
+
+
+def _fenced_blocks(text: str) -> list[tuple[str, str]]:
+    """(lang, body) for every ```lang\\n…\\n``` fence; lang stripped/lowercased."""
+    return [(m.group(1).strip().lower(), m.group(2))
+            for m in _FENCE_RE.finditer(text)]
+
+
+def _scan_slug(body: str, lang: str) -> str:
+    """Slug source: <title> → <h1> → first declaration → lang (§5.9)."""
+    for pat in (r"<title[^>]*>(.*?)</title>", r"<h1[^>]*>(.*?)</h1>"):
+        m = re.search(pat, body, re.I | re.S)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    m = _DECL_RE.search(body)
+    if m:
+        return m.group(1)
+    return lang or "artifact"
+
+
+def _classify(lang: str, body: str) -> tuple[str, str] | None:
+    """Fenced block → (type, slug) per the §5.9 precedence table, else None.
+    First matching row decides: a signal match below its threshold returns None
+    and does NOT fall through to a lower row — this is what makes a `<svg`-body
+    in an `html` fence classify as svg rather than html."""
+    b = body.strip()
+    low = b.lower()
+    if lang == "svg" or low.startswith("<svg"):
+        return ("svg", _scan_slug(body, lang)) if len(body) >= 2000 else None
+    wrapper = low.startswith("<!doctype") or low.startswith("<html")
+    if lang in ("html", "htm", "xhtml") or (lang == "" and wrapper):
+        return ("html", _scan_slug(body, lang)) if len(body) >= 160 else None
+    if lang == "" and not wrapper and len(_TAG_RE.findall(b)) >= 3:
+        return ("html", _scan_slug(body, lang)) if len(body) >= 1200 else None
+    if lang == "mermaid":
+        return ("mermaid", _scan_slug(body, lang))
+    if lang in ("md", "markdown"):
+        return ("markdown", _scan_slug(body, lang)) if len(body) >= 600 else None
+    if lang not in NON_ARTIFACT_LANGS:
+        if body.count("\n") + 1 >= 48 or len(body) >= 3000:
+            return ("code", _scan_slug(body, lang))
+    return None
+
+
+def _scan_identifier(slug: str, content: str) -> str:
+    """`slug[:55] + '-' + hash8` — the hash suffix is appended AFTER the 55-char
+    slug cut and BEFORE the 64-char cap, so the deterministic suffix survives."""
+    return sanitize_identifier(slug)[:55].rstrip("-") + "-" + sha256_of(content)[:8]
+
+
+def scan(session_id: str) -> dict:
+    """Scan a session's assistant transcript for fenced artifacts (§5.9).
+    Debounced ~10 s per session; idempotent — dedups candidates by content hash
+    against every existing version, linking the session to the matched artifact."""
+    now = time.time()
+    last = _scan_seen.get(session_id)
+    if last is not None and now - last < _SCAN_DEBOUNCE:
+        return {"found": 0, "skipped": 0}
+    _scan_seen[session_id] = now
+
+    found = skipped = 0
+    for text in _read_assistant_messages(session_id):
+        for lang, body in _fenced_blocks(text):
+            hit = _classify(lang, body)
+            if hit is None:
+                continue
+            type_, slug = hit
+            sha = sha256_of(body)
+            conn = _connect()
+            try:
+                owner = conn.execute(
+                    "SELECT identifier FROM versions WHERE sha256 = ? LIMIT 1",
+                    (sha,)).fetchone()
+            finally:
+                conn.close()
+            if owner:
+                skipped += 1
+                record_session(owner[0], session_id)
+                continue
+            add_version(
+                _scan_identifier(slug, body), type_=type_, title=slug,
+                language=(lang if type_ == "code" else None), content=body,
+                origin="scan", source="scan", session_id=session_id)
+            found += 1
+    return {"found": found, "skipped": skipped}
+
+
 def _selfcheck() -> None:
     # skeleton assertions grow every task
     assert normalize("a\r\nb\n") == "a\nb"
@@ -702,6 +840,46 @@ def _selfcheck() -> None:
                 assert get_config()["project_root"] == pr
             set_config({"project_root": None})
             assert get_config()["project_root"] is None
+    finally:
+        if saved is None: os.environ.pop("HERMES_HOME", None)
+        else: os.environ["HERMES_HOME"] = saved
+
+    # Task 10: transcript scan — classifier + dedup + debounce (own clean DB)
+    saved = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            _scan_seen.clear()
+            BLOCKS = {
+              "html_doc": "```html\n<!doctype html><html><body>" + "x" * 200 + "</body></html>\n```",
+              "svg_in_html": "```html\n<svg width='9'>" + "p" * 2100 + "</svg>\n```",
+              "mermaid": "```mermaid\ngraph TD; A-->B\n```",
+              "js_short": "```js\nconst a = 1\n```",
+              "js_long": "```js\n" + "\n".join(f"const x{i} = {i}" for i in range(60)) + "\n```",
+              "diff": "```diff\n- a\n+ b\n```",
+              "md_small": "```md\n" + "word " * 20 + "\n```",
+              "md_big": "```markdown\n" + "word " * 200 + "\n```",
+            }
+            _orig = _read_assistant_messages
+            globals()["_read_assistant_messages"] = lambda sid: ["".join(BLOCKS.values())]
+            try:
+                r = scan("sess-x")
+                ids = [a["identifier"] for a in list_artifacts("sess-x")]
+                types = {a["identifier"]: a["type"] for a in list_artifacts("sess-x")}
+                assert any(t == "svg" for t in types.values())        # precedence: svg wins in an html fence
+                assert sum(t == "html" for t in types.values()) == 1
+                assert any(t == "mermaid" for t in types.values())
+                assert any(t == "code" for t in types.values())       # js_long
+                assert not any(types[i] == "code" and "1" in i for i in ids)  # js_short skipped (not enough lines)
+                assert any(t == "markdown" for t in types.values())   # md_big
+                assert sum(t == "markdown" for t in types.values()) == 1  # md_small skipped
+                r2 = scan("sess-x2")
+                assert r2["found"] == 0 and r2["skipped"] >= 4  # dedup by hash, links the new session
+                assert any(a["in_session"] for a in list_artifacts("sess-x2"))
+                long_slug = _scan_identifier("a" * 90, "body")
+                assert len(long_slug) <= 64 and long_slug.endswith(sha256_of("body")[:8])
+            finally:
+                globals()["_read_assistant_messages"] = _orig
     finally:
         if saved is None: os.environ.pop("HERMES_HOME", None)
         else: os.environ["HERMES_HOME"] = saved
