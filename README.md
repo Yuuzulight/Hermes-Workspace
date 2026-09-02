@@ -1,9 +1,12 @@
 # Hermes Workspace
 
-Your Obsidian vault as long-term memory for Hermes Desktop. No AI provider owns
-your memory — the vault does. Works the same whichever model you have active.
+Your Obsidian vault as long-term memory and durable output for Hermes Desktop.
+No AI provider owns your memory — the vault does. Works the same whichever
+model you have active.
 
-v1 ships the **Knowledge** module:
+Two modules ship in this plugin:
+
+## Knowledge
 
 - **Read** — a composer toggle. When on, relevant notes from your vault are
   pulled in and prepended to your message before it is sent.
@@ -11,28 +14,58 @@ v1 ships the **Knowledge** module:
   finished chat; you approve each; approved ones are appended to your notes,
   following your vault's own capture conventions.
 
+## Creator
+
+Durable, versioned artifacts your agent can produce and revise across a
+session, backed by their own store (`cr_store.py`) rather than living only in
+chat scrollback. The agent gets three tools:
+
+- **`create_artifact`** — save a new artifact (code, HTML, SVG, Markdown, or
+  Mermaid) with a title and content.
+- **`update_artifact`** — save a new version of an existing artifact.
+- **`read_artifact`** — read back the current (or a prior) version.
+
+A **Creator** pane docks beside Knowledge: it lists artifacts, renders a live
+preview per type, and lets you step through and restore prior versions.
+
+**Phase 1 scope** — types `code`, `html`, `svg`, `markdown`, `mermaid`. No
+`react` support yet; that lands in Phase 2 along with a bundled preview
+runtime, an error/console strip, CodeMirror editing, export, and Gist
+publish.
+
 ## Requirements
 
 - Hermes Desktop 0.20.x
-- An Obsidian vault (a folder of `.md` files)
+- An Obsidian vault (a folder of `.md` files) — required for Knowledge; not
+  needed to use Creator on its own
 - Python with SQLite FTS5 (Hermes bundles this)
 
 ## Install
 
-1. Copy `plugin/hermes-workspace/` into `~/.hermes/plugins/`
-   (`%LOCALAPPDATA%\hermes\plugins\` on Windows).
-2. Add the plugin to the backend allow-list in `~/.hermes/config.yaml`:
+1. Copy `plugin/hermes-workspace/` into `~/.hermes/plugins/hermes-workspace/`
+   (`%LOCALAPPDATA%\hermes\plugins\hermes-workspace\` on Windows).
+2. Run `hermes plugins enable hermes-workspace`. This adds the plugin to
+   `plugins.enabled` in `~/.hermes/config.yaml` and enables the agent +
+   dashboard halves of **both** Knowledge and Creator:
    ```yaml
    plugins:
      enabled:
        - hermes-workspace
    ```
-3. Restart Hermes Desktop.
-4. Open the **Knowledge** pane via the "Toggle Knowledge" command in the
-   command palette, then set your vault folder in the plugin settings.
-5. Optional: drop an `agent_rules.md` in your vault (or point `rules_file` at
-   one) to override the default capture conventions. See
-   `plugin/hermes-workspace/dashboard/default_rules.md` for the defaults.
+3. Restart Hermes Desktop. The renderer half (both panes) auto-loads on
+   discovery — no Settings toggle needed to turn it on. It can be *disabled*
+   afterwards in **Settings → Plugins**.
+4. `create_artifact` / `update_artifact` / `read_artifact` appear to the
+   agent alongside the existing Knowledge tools, and "Open Creator" appears
+   in the command palette. The Creator pane docks beside Knowledge. For
+   Knowledge specifically, open it via the "Toggle Knowledge" command and set
+   your vault folder in the plugin settings.
+5. Optional:
+   - Knowledge: drop an `agent_rules.md` in your vault (or point `rules_file`
+     at one) to override the default capture conventions. See
+     `plugin/hermes-workspace/dashboard/default_rules.md` for the defaults.
+   - Creator: `project_root` and `github_token` in the Creator settings
+     (`github_token` is only needed for Phase 3's Gist publish).
 
 ## How memories are written
 
@@ -67,5 +100,30 @@ python selftest.py
 ```
 
 Framework-free; runs every module self-check plus the full HTTP read + write +
-reversible round-trip. The renderer half (`desktop/plugin.js`) is a single file
-with no build step — edit and Hermes hot-reloads it.
+reversible round-trip for both modules — 12 checks in all: 6 Knowledge module
+checks, 3 Knowledge HTTP checks, and one each for `cr_store`, the Creator HTTP
+router, and the defensive mount (missing Creator dependency degrades cleanly
+instead of taking Knowledge down with it).
+
+The renderer half (`desktop/plugin.js`) is a single file with no build step —
+edit and Hermes hot-reloads it. Syntax-check it directly:
+
+```bash
+node --check plugin/hermes-workspace/desktop/plugin.js
+```
+
+## Manual verification
+
+`selftest.py` and `node --check` cover everything scriptable without a real
+Hermes Desktop. The renderer behavior below needs a human with an actual
+install — walk this after any Creator change, per design-creator.md §9.2:
+
+- Create an artifact from a chat via a tool call (`create_artifact`) and
+  confirm it shows up in the Creator pane.
+- Edit it and Save — a new version is created, not an overwrite.
+- Step the version stepper back and forward, then restore an older version.
+- Each of the 5 Phase 1 types — `code`, `html`, `svg`, `markdown`, `mermaid`
+  — renders correctly in the preview.
+- The artifact picker lists and switches between artifacts correctly.
+- Kill and restart the dashboard process while the pane is open, and confirm
+  the pane retries gracefully instead of getting stuck or erroring out.
