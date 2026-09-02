@@ -377,6 +377,76 @@ def _selfcheck_creator_http() -> None:
     print("  creator http round-trip ok")
 
 
+def _selfcheck_creator_export() -> None:
+    """Task 29: standalone `.html` export — html/svg/code/markdown each produce
+    a non-empty file on disk containing the artifact's content; markdown's file
+    also carries the inlined viewer.js bundle (the `renderMarkdown` call the
+    bootstrap script makes into it, plus its multi-MB bulk); `react` export
+    returns 400 (assembled client-side in the pane, not reproducible server-side)."""
+    import tempfile
+    saved = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            import cr_api
+            from fastapi import FastAPI
+            from fastapi.testclient import TestClient
+            app = FastAPI(); app.include_router(cr_api.router)
+            c = TestClient(app)
+
+            seeds = {
+                "exp-html": ("html", "<h1>Hi There</h1>"),
+                "exp-svg": ("svg", "<svg><circle r='5'/></svg>"),
+                "exp-code": ("code", "print(1)\nprint(2)"),
+                "exp-md": ("markdown", "# Hello World"),
+            }
+            for ident, (type_, content) in seeds.items():
+                cr_api.cr_store.do_create(
+                    {"identifier": ident, "type": type_, "title": ident, "content": content},
+                    "sess-export")
+
+            paths = {}
+            for ident, (type_, content) in seeds.items():
+                r = c.post(f"/creator/artifacts/{ident}/export")
+                assert r.status_code == 200, (ident, r.status_code, r.text)
+                path = r.json()["path"]
+                assert os.path.isfile(path), path
+                text = open(path, encoding="utf-8").read()
+                assert text, f"{ident} export is empty"
+                assert content in text, (ident, content, text[:200])
+                paths[ident] = text
+
+            # markdown export carries the inlined viewer.js bundle: the bootstrap
+            # script literally calls mod.renderMarkdown(...), and the bundle
+            # itself (marked + mermaid) is multi-MB, so a small file rules it out.
+            assert "renderMarkdown" in paths["exp-md"]
+            assert len(paths["exp-md"]) > 500_000, len(paths["exp-md"])
+
+            # react: not reproducible server-side -> 400
+            cr_api.cr_store.do_create(
+                {"identifier": "exp-react", "type": "react", "title": "R",
+                 "content": "export default () => null"}, "sess-export")
+            rr = c.post("/creator/artifacts/exp-react/export")
+            assert rr.status_code == 400, rr.status_code
+
+            # write_export_bundle: pane-assembled HTML persisted verbatim
+            b = c.post("/creator/artifacts/exp-html/export/bundle",
+                      json={"html": "<!doctype html><html><body>bundled</body></html>"})
+            assert b.status_code == 200
+            bpath = b.json()["path"]
+            assert os.path.isfile(bpath)
+            assert open(bpath, encoding="utf-8").read() == \
+                "<!doctype html><html><body>bundled</body></html>"
+
+            # dest validation: relative path rejected
+            bad = c.post("/creator/artifacts/exp-html/export", json={"dest": "relative.html"})
+            assert bad.status_code == 400, bad.status_code
+    finally:
+        if saved is None: os.environ.pop("HERMES_HOME", None)
+        else: os.environ["HERMES_HOME"] = saved
+    print("  creator export ok")
+
+
 def _selfcheck_creator_defensive_mount() -> None:
     """A throw from `import cr_api` must leave every hw_* route mounted and log a warning."""
     import builtins
@@ -429,5 +499,6 @@ if __name__ == "__main__":
     _selfcheck_cr_tools()
     _selfcheck_read_assistant_messages()
     _selfcheck_creator_http()
+    _selfcheck_creator_export()
     _selfcheck_creator_defensive_mount()
     print("ok")

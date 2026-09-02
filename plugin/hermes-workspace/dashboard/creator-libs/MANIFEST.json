@@ -104,5 +104,9 @@
   "codemirror": {
     "file": "codemirror.js",
     "subdeps": []
+  },
+  "viewer": {
+    "file": "viewer.js",
+    "subdeps": []
   }
 }

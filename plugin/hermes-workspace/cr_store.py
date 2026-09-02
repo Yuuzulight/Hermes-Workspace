@@ -1,5 +1,5 @@
 """Creator store — all Creator behaviour. stdlib only; no relative imports."""
-import base64, difflib, hashlib, json, os, re, shutil, sqlite3, time
+import base64, difflib, hashlib, html, json, os, re, shutil, sqlite3, time
 from pathlib import Path
 
 
@@ -587,6 +587,143 @@ def set_config(patch: dict) -> dict:
         raise
 
     return get_config()
+
+
+# ── Standalone .html export (§7.2) ────────────────────────────────────────────
+
+_VIEWER_JS_PATH = Path(__file__).resolve().parent / "dashboard" / "creator-libs" / "viewer.js"
+
+
+def _validate_export_dest(dest: str) -> Path:
+    """Sanity-check a caller-supplied export path. `dest` writes OUTSIDE the
+    creator store to wherever the pane assembled it (e.g. a save-dialog path),
+    so there's no "stay inside the store" invariant to enforce the way
+    delete_artifact/sanitize_identifier do for artifact-content paths — this is
+    deliberately looser. What IS enforced, mirroring set_config's project_root
+    check on the same file: `dest` must be an absolute path (no relative-to-cwd
+    ambiguity from an HTTP body) and its parent directory must already exist
+    (refuses to fabricate an arbitrary directory tree from a malformed
+    request); `dest` itself must not already be a directory."""
+    if not dest or not isinstance(dest, str):
+        raise StoreBadInput("dest must be a non-empty path")
+    p = Path(dest)
+    if not p.is_absolute():
+        raise StoreBadInput("dest must be an absolute path")
+    if p.is_dir():
+        raise StoreBadInput("dest must be a file path, not a directory")
+    if not p.parent.is_dir():
+        raise StoreBadInput("dest's parent directory does not exist")
+    return p
+
+
+def _export_dest(identifier: str, dest: str | None) -> Path:
+    """Resolve the write path for an export: `dest` if given (validated), else
+    `_creator_dir()/exports/<dir>-v<N>.html` (dir created if missing)."""
+    row = _meta(identifier)
+    if row is None:
+        raise StoreNotFound(f"no artifact '{identifier}' — call create_artifact first")
+    dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
+    if dest:
+        return _validate_export_dest(dest)
+    exports = _creator_dir() / "exports"
+    exports.mkdir(parents=True, exist_ok=True)
+    return exports / f"{dir_}-v{maxn}.html"
+
+
+def _write_export(path: Path, data: bytes) -> None:
+    """Atomic write for an export file (tmp + os.replace), same pattern as
+    set_config. No fsync: an export file isn't the source of truth the way an
+    artifact version is — a crash mid-write just means re-exporting."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def _minimal_doc(title: str, body: str) -> str:
+    """A minimal self-contained HTML document wrapping `body` (already HTML)."""
+    return (
+        '<!doctype html>\n<html><head><meta charset="utf-8">'
+        f"<title>{html.escape(title or 'artifact')}</title></head>\n"
+        f"<body>{body}</body></html>\n"
+    )
+
+
+def _embed_js_string(s: str) -> str:
+    """JSON-encode `s` for embedding in an inline <script> — escape "</" so a
+    literal "</script" inside the payload can't close the tag early."""
+    return json.dumps(s).replace("</", "<\\/")
+
+
+def _viewer_doc(title: str, type_: str, source: str) -> str:
+    """markdown/mermaid export: embed the raw source + the vendored viewer.js
+    bundle (Task 29 — marked + mermaid) inlined verbatim, loaded via the same
+    blob-module `import(URL.createObjectURL(...))` mechanism the desktop
+    plugin already uses to load codemirror.js (design-creator.md §7.1) — fully
+    offline, no server, no network fetch of viewer.js at export time."""
+    viewer_code = _VIEWER_JS_PATH.read_text(encoding="utf-8")
+    is_markdown = "true" if type_ == "markdown" else "false"
+    body = (
+        '<div id="root">Loading…</div>\n'
+        f"<script>window.__CR_SRC__={_embed_js_string(source)};"
+        f"window.__CR_VIEWER__={_embed_js_string(viewer_code)};</script>\n"
+        "<script>(function(){"
+        "var blobUrl = URL.createObjectURL(new Blob([window.__CR_VIEWER__], {type: 'text/javascript'}));"
+        "import(blobUrl).then(function(mod){"
+        "var root = document.getElementById('root');"
+        f"if ({is_markdown}) {{ root.innerHTML = mod.renderMarkdown(window.__CR_SRC__); }}"
+        "else { return mod.renderMermaidInto(root, window.__CR_SRC__); }"
+        "}).catch(function(err){"
+        "document.getElementById('root').textContent = 'render failed: ' + err;"
+        "});"
+        "})();</script>\n"
+    )
+    return _minimal_doc(title, body)
+
+
+def export_artifact(identifier: str, dest: str | None = None) -> str:
+    """Standalone `.html` export (§7.2). `react` is assembled client-side in the
+    pane (esbuild bundle + the renderer's already-computed Tailwind CSS) — not
+    reproducible here, so it raises. Returns the written file's absolute path."""
+    row = _meta(identifier)
+    if row is None:
+        raise StoreNotFound(f"no artifact '{identifier}' — call create_artifact first")
+    dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
+    if type_ == "react":
+        raise StoreBadInput("react export is assembled in the pane")
+    content = get_version(identifier, maxn)["content"]
+
+    # code + dest ending in the artifact's own extension -> raw file, no wrap.
+    if type_ == "code" and dest and dest.endswith("." + maxn_ext):
+        path = _validate_export_dest(dest)
+        _write_export(path, content.encode("utf-8"))
+        return str(path)
+
+    if type_ == "html":
+        doc = content if re.search(r"<html[\s>]", content, re.I) else _minimal_doc(title, content)
+    elif type_ == "svg":
+        doc = _minimal_doc(title, content)
+    elif type_ == "code":
+        doc = _minimal_doc(title, f"<pre>{html.escape(content)}</pre>")
+    elif type_ in ("markdown", "mermaid"):
+        doc = _viewer_doc(title, type_, content)
+    else:
+        raise StoreBadInput(f"cannot export type '{type_}'")
+
+    return write_export_bundle(identifier, doc, dest)
+
+
+def write_export_bundle(identifier: str, html: str, dest: str | None = None) -> str:
+    """Persist a pane-assembled export (the `react` path: the renderer already
+    built the full HTML string). Same destination resolution as
+    export_artifact — `dest` if given, else `exports/<dir>-v<N>.html`."""
+    path = _export_dest(identifier, dest)
+    _write_export(path, html.encode("utf-8"))
+    return str(path)
 
 
 # ── Transcript scan (§5.9) ────────────────────────────────────────────────────

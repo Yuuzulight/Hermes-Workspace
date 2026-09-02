@@ -40,6 +40,10 @@ const LIBS = [
   // + lang-{javascript,html,css,python,markdown} + the one-dark theme (see
   // ./codemirror-entry.js header). No React dependency, so nothing external.
   { specifier: 'codemirror', entryPoint: './codemirror-entry.js', outfile: './codemirror.js' },
+  // Facade over `marked` + `mermaid` (see ./viewer-entry.js header) — inlined
+  // verbatim into a Task 29 markdown/mermaid `.html` export so it renders
+  // fully offline. No React dependency, so nothing external.
+  { specifier: 'viewer', entryPoint: './viewer-entry.js', outfile: './viewer.js' },
 ]
 
 const here = (p) => new URL(p, import.meta.url)
