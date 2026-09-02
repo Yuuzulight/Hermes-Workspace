@@ -4,7 +4,7 @@
 // that file's header): a source file that IS this bundle's entry point,
 // bundled by build.mjs's LIBS loop like any other lib.
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection } from '@codemirror/view'
-import { EditorState } from '@codemirror/state'
+import { EditorState, Compartment } from '@codemirror/state'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { syntaxHighlighting, defaultHighlightStyle, bracketMatching, indentOnInput } from '@codemirror/language'
 import { search, searchKeymap, highlightSelectionMatches } from '@codemirror/search'
@@ -56,4 +56,4 @@ function readOnly(value) {
   return EditorState.readOnly.of(value)
 }
 
-export { EditorView, EditorState, basicExtensions, readOnly }
+export { EditorView, EditorState, basicExtensions, readOnly, Compartment }

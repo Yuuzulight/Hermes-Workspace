@@ -1936,21 +1936,19 @@ function crCodeMirror() {
   return crCodeMirrorPromise
 }
 
-// Rich editor wrapper (task-27). `basicExtensions`/`readOnly` are all
-// codemirror-entry.js exports (task-26 report) — no `Compartment` and no bare
-// `keymap` facet are part of that surface, so live reconfiguration below
-// leans on two things that ARE static members of the exported `EditorView`
-// class: `EditorView.updateListener` for the dirty/onChange wire and
-// `EditorView.domEventHandlers` for the Mod-s save shortcut (CM6's normal
-// alternative to a one-off `keymap.of(...)` entry). Toggling `readOnly` after
-// mount goes through `view.setState(EditorState.create(...))` — a fresh state
-// dropped onto the SAME EditorView/DOM instance, not a Compartment-scoped
-// facet swap (which we have no Compartment to build), but it still avoids the
-// full `destroy()` + reconstruct the brief warns against.
-function crCmExtensions(cm, { language, dark, readOnly, onChange, onSave }) {
+// Rich editor wrapper (task-27, readOnly-toggle fixed per review). `readOnly`
+// is wrapped in its own `Compartment` (added to codemirror-entry.js's exports
+// for this fix — see that file's header) so toggling it later is a
+// `view.dispatch({effects: compartment.reconfigure(...)})`, not a full state
+// rebuild: selection/scroll/undo-history all survive untouched because the
+// rest of the config (including `history()` inside `basicExtensions`) is
+// never re-instantiated. `EditorView.updateListener`/`domEventHandlers` are
+// static members of the exported `EditorView` class, used for the
+// dirty/onChange wire and the Mod-s save shortcut (CM6's normal alternative
+// to a one-off `keymap.of(...)` entry).
+function crCmExtensions(cm, { language, dark, onChange, onSave }) {
   return [
     cm.basicExtensions(language, dark),
-    cm.readOnly(!!readOnly),
     cm.EditorView.updateListener.of((u) => {
       if (u.docChanged) onChange?.(u.state.doc.toString())
     }),
@@ -1970,6 +1968,7 @@ function crCmExtensions(cm, { language, dark, readOnly, onChange, onSave }) {
 function CrCmEditor({ value, language, readOnly, onChange, onSave }) {
   const hostRef = useRef(null)
   const viewRef = useRef(null)
+  const roCompartmentRef = useRef(null)
   const propsRef = useRef({ value, language, readOnly, onChange, onSave })
   propsRef.current = { value, language, readOnly, onChange, onSave }
   const [cmOk, setCmOk] = useState(null) // null = loading, false = unavailable, true = mounted
@@ -1983,9 +1982,11 @@ function CrCmEditor({ value, language, readOnly, onChange, onSave }) {
         return
       }
       const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches
+      const roCompartment = new cm.Compartment()
+      roCompartmentRef.current = roCompartment
       viewRef.current = new cm.EditorView({
         doc: propsRef.current.value || '',
-        extensions: crCmExtensions(cm, { ...propsRef.current, dark }),
+        extensions: [...crCmExtensions(cm, { ...propsRef.current, dark }), roCompartment.of(cm.readOnly(!!propsRef.current.readOnly))],
         parent: hostRef.current,
       })
       setCmOk(true)
@@ -1994,6 +1995,7 @@ function CrCmEditor({ value, language, readOnly, onChange, onSave }) {
       cancelled = true
       viewRef.current?.destroy()
       viewRef.current = null
+      roCompartmentRef.current = null
     }
   }, [])
 
@@ -2005,16 +2007,11 @@ function CrCmEditor({ value, language, readOnly, onChange, onSave }) {
 
   useEffect(() => {
     const view = viewRef.current
-    if (!view) return
+    const roCompartment = roCompartmentRef.current
+    if (!view || !roCompartment) return
     crCodeMirror().then((cm) => {
       if (!cm || viewRef.current !== view) return
-      const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches
-      view.setState(
-        cm.EditorState.create({
-          doc: view.state.doc,
-          extensions: crCmExtensions(cm, { ...propsRef.current, dark, readOnly }),
-        }),
-      )
+      view.dispatch({ effects: roCompartment.reconfigure(cm.readOnly(!!readOnly)) })
     })
   }, [readOnly])
 
