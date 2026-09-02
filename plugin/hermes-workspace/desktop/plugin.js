@@ -1121,6 +1121,55 @@ const crQs = (obj) =>
     .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
     .join('&')
 
+// Phase 2 spike (spec §6.1-6.2): fetch+decode+verify a creator-libs asset,
+// and bootstrap esbuild-wasm from it. crAssetCache/crEsbuildPromise are
+// module-scoped so both survive across pane remounts for the plugin's life.
+const crAssetCache = new Map() // name -> Uint8Array | string
+const crHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+
+async function crAsset(name) {
+  if (crAssetCache.has(name)) return crAssetCache.get(name)
+  const env = await crApi('/creator/asset/' + name, { timeoutMs: 120000 })
+  const bytes =
+    env.encoding === 'base64'
+      ? Uint8Array.from(atob(env.data), (c) => c.charCodeAt(0))
+      : new TextEncoder().encode(env.data)
+  const digest = crHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+  if (digest !== env.sha256) throw new Error(`crAsset(${name}): sha256 mismatch`)
+  const value = env.encoding === 'base64' ? bytes : env.data
+  crAssetCache.set(name, value)
+  return value
+}
+
+let crEsbuildPromise = null
+
+// esbuild-wasm's vendored browser driver (creator-libs/esbuild.js is the raw
+// esbuild-wasm/lib/browser.min.js UMD build, not an ES module) has no export
+// statements; blob-importing it as a module runs its top-level code, which
+// falls through its `module` check and assigns `self.esbuild` instead.
+function crEsbuild() {
+  if (crEsbuildPromise) return crEsbuildPromise
+  crEsbuildPromise = (async () => {
+    const src = await crAsset('esbuild.js')
+    const blobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))
+    try {
+      await import(blobUrl)
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+    const esbuild = globalThis.esbuild
+    if (!esbuild) throw new Error('crEsbuild: esbuild.js did not expose a global esbuild')
+    const wasmModule = await WebAssembly.compile(await crAsset('esbuild.wasm'))
+    try {
+      await esbuild.initialize({ wasmModule, worker: true })
+    } catch {
+      await esbuild.initialize({ wasmModule, worker: false })
+    }
+    return esbuild
+  })()
+  return crEsbuildPromise
+}
+
 const crSid$ = atom('') // focusedStoredSessionId at last poll ('' = no chat)
 const crOpen$ = atom(null) // open artifact identifier | null
 const crList$ = atom([]) // [{identifier,type,title,version,updated_at,origin,in_session}]
@@ -1705,6 +1754,25 @@ function crRegister(ctx) {
           crScan()
             .then(() => host.notify({ kind: 'info', message: 'Rescanned' }))
             .catch((e) => host.notifyError(e, 'Rescan failed')),
+      },
+    },
+    {
+      id: 'cr-palette-smoke',
+      area: PALETTE_AREA,
+      data: {
+        id: 'hermes-workspace.creator-esbuild-smoke',
+        label: 'Creator: esbuild smoke test',
+        run: async () => {
+          const es = await crEsbuild()
+          const r = await es.build({
+            stdin: { contents: 'export default () => 42', loader: 'js' },
+            bundle: true,
+            format: 'iife',
+            globalName: '__Smoke',
+            write: false,
+          })
+          host.notify({ kind: 'info', message: `bundle ${r.outputFiles[0].text.length} bytes` })
+        },
       },
     },
   ])
