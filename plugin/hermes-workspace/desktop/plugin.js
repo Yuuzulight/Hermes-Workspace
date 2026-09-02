@@ -1275,6 +1275,7 @@ async function crBundle(source) {
       jsx: 'automatic',
       jsxImportSource: 'react',
       write: false,
+      minify: true,
       plugins: [crVfsPlugin(manifest)],
     })
     result = { ok: true, code: built.outputFiles[0].text }
