@@ -497,6 +497,68 @@ def delete_artifact(identifier) -> None:
     shutil.rmtree(d, ignore_errors=True)
 
 
+def get_config() -> dict:
+    """Read config from _creator_dir()/config.json. Missing file defaults to
+    {"project_root": None, "github_token_set": False}."""
+    cfg_path = _creator_dir() / "config.json"
+    if not cfg_path.exists():
+        return {"project_root": None, "github_token_set": False}
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        # Always return github_token_set as bool, never the token value
+        return {
+            "project_root": data.get("project_root"),
+            "github_token_set": bool(data.get("github_token")),
+        }
+    except Exception:
+        return {"project_root": None, "github_token_set": False}
+
+
+def set_config(patch: dict) -> dict:
+    """Merge patch into on-disk config, write atomically. Validates project_root
+    (absolute, exists, is dir, or None). Stores github_token, never echoes it.
+    Returns get_config()."""
+    cfg_path = _creator_dir() / "config.json"
+
+    # Read current config
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    else:
+        data = {}
+
+    # Merge patch
+    if "project_root" in patch:
+        pr = patch["project_root"]
+        if pr is not None:
+            # Validate: absolute, exists, is a dir
+            pr_path = Path(pr)
+            if not pr_path.is_absolute():
+                raise StoreBadInput("project_root must be an absolute path or None")
+            if not pr_path.exists():
+                raise StoreBadInput("project_root must exist")
+            if not pr_path.is_dir():
+                raise StoreBadInput("project_root must be a directory")
+        data["project_root"] = pr
+
+    if "github_token" in patch:
+        data["github_token"] = patch["github_token"]
+
+    # Write atomically
+    tmp = cfg_path.with_name(cfg_path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, cfg_path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+    return get_config()
+
+
 def _selfcheck() -> None:
     # skeleton assertions grow every task
     assert normalize("a\r\nb\n") == "a\nb"
@@ -628,6 +690,18 @@ def _selfcheck() -> None:
             except StoreNotFound: pass
             # session_id=None -> nothing in_session
             assert all(not a["in_session"] for a in list_artifacts(None))
+
+            # Task 8: get_config / set_config
+            assert get_config() == {"project_root": None, "github_token_set": False}
+            set_config({"github_token": "ghp_x"})
+            assert get_config()["github_token_set"] is True
+            assert "ghp_x" not in json.dumps(get_config())
+            import tempfile as _t
+            with _t.TemporaryDirectory() as pr:
+                set_config({"project_root": pr})
+                assert get_config()["project_root"] == pr
+            set_config({"project_root": None})
+            assert get_config()["project_root"] is None
     finally:
         if saved is None: os.environ.pop("HERMES_HOME", None)
         else: os.environ["HERMES_HOME"] = saved
