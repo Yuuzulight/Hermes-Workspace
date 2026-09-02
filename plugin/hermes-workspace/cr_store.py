@@ -28,6 +28,47 @@ def sanitize_identifier(raw: str) -> str:
     return s or "artifact"
 
 
+LANG_EXT = {
+    "python": "py",
+    "javascript": "js",
+    "js": "js",
+    "typescript": "ts",
+    "ts": "ts",
+    "jsx": "jsx",
+    "tsx": "tsx",
+    "bash": "sh",
+    "sh": "sh",
+    "json": "json",
+    "css": "css",
+    "html": "html",
+    "sql": "sql",
+    "go": "go",
+    "rust": "rs",
+    "rs": "rs",
+}
+
+TYPE_EXT = {
+    "markdown": "md",
+    "mermaid": "mmd",
+    "html": "html",
+    "svg": "svg",
+    "react": "jsx",
+}
+
+
+def sha256_of(content: str) -> str:
+    """Hash normalized content with SHA-256, hex-encoded."""
+    normalized = normalize(content)
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def ext_for(type_: str, language: str | None) -> str:
+    """Return file extension (no leading dot) for artifact type and optional language."""
+    if type_ == "code":
+        return LANG_EXT.get(language, "txt") if language else "txt"
+    return TYPE_EXT.get(type_, "txt")
+
+
 def _hermes_home() -> Path:
     try:
         from hermes_constants import get_hermes_home
@@ -130,6 +171,14 @@ def _selfcheck() -> None:
     assert sanitize_identifier("a" * 200) == "a" * 64
     assert sanitize_identifier("---a---b---") == "a-b"
     assert not sanitize_identifier("9lives")[0].isdigit()
+
+    # Task 4: sha256_of, TYPE_EXT, LANG_EXT, ext_for
+    assert sha256_of("x\r\n") == sha256_of("x\n") == sha256_of("x")
+    assert ext_for("markdown", None) == "md"
+    assert ext_for("mermaid", None) == "mmd"
+    assert ext_for("code", "python") == "py"
+    assert ext_for("code", "brainfuck") == "txt"
+    assert ext_for("react", None) == "jsx"
 
 
 if __name__ == "__main__":
