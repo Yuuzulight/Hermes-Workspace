@@ -1,0 +1,39 @@
+{
+  "name": "creator-libs",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Build harness that vendors esbuild-wasm (and later, the Creator plugin's browser-side JS library set) for the Hermes Workspace dashboard's Creator module.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "verify": "node verify.mjs"
+  },
+  "dependencies": {
+    "esbuild-wasm": "0.28.2",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "recharts": "3.10.1",
+    "lucide-react": "1.39.0",
+    "d3": "7.9.0",
+    "three": "0.185.1",
+    "@react-three/fiber": "9.7.0",
+    "papaparse": "5.7.0",
+    "xlsx": "0.18.5",
+    "mathjs": "15.2.0",
+    "tone": "15.1.22",
+    "@tanstack/react-table": "9.2.4",
+    "lodash": "4.18.1",
+    "date-fns": "4.4.0",
+    "framer-motion": "13.2.0",
+    "clsx": "2.1.1",
+    "tailwind-merge": "3.6.0",
+    "class-variance-authority": "0.7.1",
+    "tailwindcss": "4.3.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

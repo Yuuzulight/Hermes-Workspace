@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .superpowers/
 .DS_Store
+plugin/hermes-workspace/dashboard/creator-libs/node_modules/

@@ -1,0 +1,104 @@
+{
+  "react": {
+    "file": "react.js",
+    "subdeps": []
+  },
+  "react-dom": {
+    "file": "react-dom.js",
+    "subdeps": [
+      "react"
+    ]
+  },
+  "react-dom/client": {
+    "file": "react-dom-client.js",
+    "subdeps": [
+      "react",
+      "react-dom"
+    ]
+  },
+  "react/jsx-runtime": {
+    "file": "react-jsx-runtime.js",
+    "subdeps": []
+  },
+  "recharts": {
+    "file": "recharts.js",
+    "subdeps": [
+      "react",
+      "react-dom"
+    ]
+  },
+  "lucide-react": {
+    "file": "lucide-react.js",
+    "subdeps": [
+      "react"
+    ]
+  },
+  "d3": {
+    "file": "d3.js",
+    "subdeps": []
+  },
+  "three": {
+    "file": "three.js",
+    "subdeps": []
+  },
+  "@react-three/fiber": {
+    "file": "react-three-fiber.js",
+    "subdeps": [
+      "react",
+      "react/jsx-runtime"
+    ]
+  },
+  "papaparse": {
+    "file": "papaparse.js",
+    "subdeps": []
+  },
+  "xlsx": {
+    "file": "xlsx.js",
+    "subdeps": []
+  },
+  "mathjs": {
+    "file": "mathjs.js",
+    "subdeps": []
+  },
+  "tone": {
+    "file": "tone.js",
+    "subdeps": []
+  },
+  "@tanstack/react-table": {
+    "file": "tanstack-react-table.js",
+    "subdeps": [
+      "react"
+    ]
+  },
+  "lodash": {
+    "file": "lodash.js",
+    "subdeps": []
+  },
+  "date-fns": {
+    "file": "date-fns.js",
+    "subdeps": []
+  },
+  "framer-motion": {
+    "file": "framer-motion.js",
+    "subdeps": [
+      "react/jsx-runtime",
+      "react"
+    ]
+  },
+  "clsx": {
+    "file": "clsx.js",
+    "subdeps": []
+  },
+  "tailwind-merge": {
+    "file": "tailwind-merge.js",
+    "subdeps": []
+  },
+  "class-variance-authority": {
+    "file": "class-variance-authority.js",
+    "subdeps": []
+  },
+  "tailwind": {
+    "file": "tailwind.js",
+    "subdeps": []
+  }
+}

@@ -1121,6 +1121,236 @@ const crQs = (obj) =>
     .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
     .join('&')
 
+// Phase 2 spike (spec §6.1-6.2): fetch+decode+verify a creator-libs asset,
+// and bootstrap esbuild-wasm from it. crAssetCache/crEsbuildPromise are
+// module-scoped so both survive across pane remounts for the plugin's life.
+const crAssetCache = new Map() // name -> Uint8Array | string
+const crHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+
+async function crAsset(name) {
+  if (crAssetCache.has(name)) return crAssetCache.get(name)
+  const env = await crApi('/creator/asset/' + name, { timeoutMs: 120000 })
+  const bytes =
+    env.encoding === 'base64'
+      ? Uint8Array.from(atob(env.data), (c) => c.charCodeAt(0))
+      : new TextEncoder().encode(env.data)
+  const digest = crHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+  if (digest !== env.sha256) throw new Error(`crAsset(${name}): sha256 mismatch`)
+  const value = env.encoding === 'base64' ? bytes : env.data
+  crAssetCache.set(name, value)
+  return value
+}
+
+let crEsbuildPromise = null
+
+// esbuild-wasm's vendored browser driver (creator-libs/esbuild.js is the raw
+// esbuild-wasm/lib/browser.min.js UMD build, not an ES module) has no export
+// statements; blob-importing it as a module runs its top-level code, which
+// falls through its `module` check and assigns `self.esbuild` instead.
+function crEsbuild() {
+  if (crEsbuildPromise) return crEsbuildPromise
+  crEsbuildPromise = (async () => {
+    const src = await crAsset('esbuild.js')
+    const blobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))
+    try {
+      await import(blobUrl)
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+    const esbuild = globalThis.esbuild
+    if (!esbuild) throw new Error('crEsbuild: esbuild.js did not expose a global esbuild')
+    const wasmModule = await WebAssembly.compile(await crAsset('esbuild.wasm'))
+    try {
+      await esbuild.initialize({ wasmModule, worker: true })
+    } catch {
+      await esbuild.initialize({ wasmModule, worker: false })
+    }
+    return esbuild
+  })().catch((e) => {
+    // Don't let a transient failure (e.g. an asset fetch blip) wedge every
+    // future call behind this same rejected promise — clear the memo so the
+    // next call retries fresh (README: "pane retries gracefully").
+    crEsbuildPromise = null
+    throw e
+  })
+  return crEsbuildPromise
+}
+
+// MANIFEST.json ({specifier: {file, subdeps}}), fetched once and memoized —
+// crAsset already caches the raw text by name, this just parses it once.
+let crManifestPromise = null
+function crManifest() {
+  if (!crManifestPromise) {
+    crManifestPromise = crAsset('MANIFEST.json')
+      .then((text) => JSON.parse(text))
+      .catch((e) => {
+        crManifestPromise = null
+        throw e
+      })
+  }
+  return crManifestPromise
+}
+
+// specifier -> Promise<string> (vendored lib source text). Module-scoped so it
+// survives across crBundle calls. This IS the "cache by name" from the brief,
+// and it doubles as the diamond-dependency de-dup: if two libs both need
+// 'react' concurrently, both onLoad calls for 'react' await this SAME
+// in-flight crAsset promise (stored before either await resolves) rather than
+// firing two fetches.
+const crLibCache = new Map()
+
+// esbuild vfs plugin: bare specifiers found in MANIFEST resolve into the
+// 'creator-vfs' namespace and load from the vendored bundle text. Anything
+// else (a relative import, an unknown package) is left alone so esbuild's own
+// resolver fails it with a normal "could not resolve" diagnostic.
+//
+// react/react-dom/react-dom-client are the one exception: they're left
+// `external` instead of inlined. React's hooks read a dispatcher that
+// react-dom's *own* evaluated 'react' module instance sets — if this bundle
+// inlined its own private copy of react.js, that copy's dispatcher would
+// never get set by whatever ReactDOM later mounts it (crReactSrcdoc's
+// preview bootstrap runs react-dom-client.js as a separate script, outside
+// this bundle's closure), and every hook call would throw "Invalid hook
+// call". Leaving them external makes esbuild emit `__require("react")` etc.
+// in the iife output; crReactSrcdoc supplies a matching global `require()`
+// resolving to the SAME window.React/window.ReactDOM instance it boots, so
+// there is exactly one React module instance shared by the artifact and its
+// renderer. react/jsx-runtime stays inlined — it's stateless (Symbol.for-
+// keyed element objects only), so a per-bundle copy is harmless.
+const CR_REACT_EXTERNAL = new Set(['react', 'react-dom', 'react-dom/client'])
+
+function crVfsPlugin(manifest) {
+  return {
+    name: 'creator-vfs',
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (args) => {
+        if (!Object.prototype.hasOwnProperty.call(manifest, args.path)) return null
+        if (CR_REACT_EXTERNAL.has(args.path)) return { path: args.path, external: true }
+        return { path: args.path, namespace: 'creator-vfs' }
+      })
+      build.onLoad({ filter: /.*/, namespace: 'creator-vfs' }, async (args) => {
+        if (!crLibCache.has(args.path)) {
+          crLibCache.set(
+            args.path,
+            crAsset(manifest[args.path].file).catch((e) => {
+              crLibCache.delete(args.path)
+              throw e
+            }),
+          )
+        }
+        return { contents: await crLibCache.get(args.path), loader: 'js' }
+      })
+    },
+  }
+}
+
+function crFormatBuildErrors(errors) {
+  return (errors || [])
+    .map((e) => {
+      const loc = e.location
+      return (loc ? `${loc.file}:${loc.line}:${loc.column}: ` : '') + e.text
+    })
+    .join('\n')
+}
+
+async function crBundleHash(source) {
+  const bytes = new TextEncoder().encode(source)
+  return crHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+}
+
+// Preview build (spec §6.2 step 3): bundle `source` (a react-artifact module)
+// against the vendored library vfs. No cache of its own — its one caller,
+// crReactBuild, already memoizes by this exact same content hash
+// (crReactBuildCache) before ever calling in, so a second Map here would
+// just be a strict-subset duplicate that never gets a hit of its own.
+async function crBundle(source) {
+  const [esbuild, manifest] = await Promise.all([crEsbuild(), crManifest()])
+  let result
+  try {
+    const built = await esbuild.build({
+      stdin: { contents: source, loader: 'tsx', resolveDir: '/', sourcefile: 'artifact.tsx' },
+      bundle: true,
+      format: 'iife',
+      globalName: '__CreatorArtifact',
+      jsx: 'automatic',
+      jsxImportSource: 'react',
+      write: false,
+      plugins: [crVfsPlugin(manifest)],
+    })
+    result = { ok: true, code: built.outputFiles[0].text }
+  } catch (e) {
+    // esbuild-wasm's build() rejects (rather than resolving with .errors) on a
+    // failed build outside a rebuild/watch context — the thrown error carries
+    // the diagnostics array.
+    const errors = e && e.errors
+    result = { ok: false, errors: errors && errors.length ? crFormatBuildErrors(errors) : String((e && e.message) || e) }
+  }
+  return result
+}
+
+// Renderer-side Tailwind compile (task-20, see creator-libs/tailwind-entry.js
+// and task-20-report.md for why the vendored `tailwind.js` wraps tailwindcss
+// v4's core `compile()` rather than `@tailwindcss/browser`). tailwind.js is a
+// real ESM (unlike esbuild.js's UMD build) so blob-importing it yields its
+// actual `compile` export directly, no globalThis fallback needed.
+let crTailwindLibPromise = null
+function crTailwindLib() {
+  if (crTailwindLibPromise) return crTailwindLibPromise
+  crTailwindLibPromise = (async () => {
+    const src = await crAsset('tailwind.js')
+    const blobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))
+    try {
+      return await import(blobUrl)
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+  })().catch((e) => {
+    crTailwindLibPromise = null
+    throw e
+  })
+  return crTailwindLibPromise
+}
+
+// Candidate extractor: tailwindcss v4's own scanner (@tailwindcss/oxide) is a
+// native/wasm package meant for scanning files, not a fit for an offline
+// browser bundle — so this is the regex sweep from the task-20 brief instead.
+const CR_CLASS_ATTR_RE = /class(?:Name)?\s*[:=]\s*["'`]([^"'`]+)/g
+
+// Broader sweep (review finding: cn()/clsx()/ternary/cva() className patterns
+// produce zero matches for CR_CLASS_ATTR_RE above, so the artifact renders
+// unstyled with no error). Every quoted string literal in the artifact's own
+// SOURCE — small, not the multi-MB bundle — split on whitespace and tossed in
+// as a candidate too. Tailwind's compile() silently drops anything that isn't
+// a real utility, so over-collecting costs nothing.
+const CR_STRING_LITERAL_RE = /["'`]([^"'`]{1,500})["'`]/g
+function crExtractCandidates(bundleText, sourceText) {
+  const candidates = new Set()
+  for (const m of bundleText.matchAll(CR_CLASS_ATTR_RE)) {
+    for (const token of m[1].split(/\s+/)) if (token) candidates.add(token)
+  }
+  if (sourceText) {
+    for (const m of sourceText.matchAll(CR_STRING_LITERAL_RE)) {
+      for (const token of m[1].split(/\s+/)) if (token) candidates.add(token)
+    }
+  }
+  return [...candidates]
+}
+
+const crTailwindCache = new Map() // sha256(candidates+themeBlock) -> css string
+
+// Preview Tailwind compile (spec task-20): extract class candidates out of a
+// bundled artifact's source text, compile against an optional @theme block.
+// Cached by content hash, same pattern as crBundle.
+async function crTailwind(bundleText, themeBlock, sourceText) {
+  const candidates = crExtractCandidates(bundleText, sourceText)
+  const hash = await crBundleHash(candidates.join(' ') + (themeBlock || ''))
+  if (crTailwindCache.has(hash)) return crTailwindCache.get(hash)
+  const { compile } = await crTailwindLib()
+  const css = await compile('@tailwind utilities;' + (themeBlock || ''), { candidates })
+  crTailwindCache.set(hash, css)
+  return css
+}
+
 const crSid$ = atom('') // focusedStoredSessionId at last poll ('' = no chat)
 const crOpen$ = atom(null) // open artifact identifier | null
 const crList$ = atom([]) // [{identifier,type,title,version,updated_at,origin,in_session}]
@@ -1290,6 +1520,156 @@ function crHtmlDoc(html) {
     prelude +
     '<style>*,*::before,*::after{box-sizing:border-box}body{margin:12px;color:var(--foreground,inherit)}</style>' +
     src
+  )
+}
+
+// Vendored creator-libs files (spec §6.1) are zero-import ESM whose only
+// top-level statement is a trailing `export default <expr>;` (confirmed
+// against the committed build.mjs output) — turning that into a plain
+// assignment is enough to run the file as a classic (non-module) <script>
+// inside the sandboxed srcdoc iframe and expose it as a window global.
+async function crReactGlobalScript(assetFile, globalName) {
+  const src = await crAsset(assetFile)
+  const marker = 'export default '
+  const at = src.lastIndexOf(marker)
+  if (at === -1) throw new Error(`crReactGlobalScript(${assetFile}): no "${marker}" found`)
+  return src.slice(0, at) + `window.${globalName} = ` + src.slice(at + marker.length)
+}
+
+// react-dom.js/react-dom-client.js call a genuine runtime `require("react")`
+// / `require("react-dom")` internally (Facebook's own CJS sources, buried
+// inside factory closures esbuild can't statically hoist to an import) — this
+// is the global `require` those calls need, resolving to the SAME instances
+// crBundle's now-external react/react-dom/react-dom-client imports resolve
+// to (see crVfsPlugin), so there is exactly one shared React module.
+const CR_REACT_REQUIRE_SHIM = `
+function require(name) {
+  if (name === 'react') return window.React
+  if (name === 'react-dom') return window.__crReactDomBase
+  if (name === 'react-dom/client') return window.ReactDOM
+  throw new Error('crReactSrcdoc: require("' + name + '") is not available in the preview iframe')
+}
+`
+
+// Minimal inline ErrorBoundary (spec §6.3/§6.4) — wraps the artifact render so
+// a render-time error shows a fallback instead of leaving a blank frame.
+// componentDidCatch also reports through the bridge (window.__crReportError,
+// installed first by crBridgeScript below) so the host pane's CrErrorStrip
+// sees it too, not just the in-frame fallback.
+const CR_ERROR_BOUNDARY_SRC = `
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null } }
+  static getDerivedStateFromError(error) { return { error } }
+  componentDidCatch(error, info) {
+    try { window.__crReportError && window.__crReportError(error) } catch (e) {}
+  }
+  render() {
+    if (this.state.error) {
+      return React.createElement('pre', {
+        style: { color: '#e5484d', padding: 12, margin: 0, whiteSpace: 'pre-wrap', fontSize: 12 },
+      }, 'Render error: ' + ((this.state.error && this.state.error.message) || this.state.error))
+    }
+    return this.props.children
+  }
+}
+`
+
+// Task 22 (spec §6.4): the preview iframe's error + console postMessage
+// bridge. Spliced as the VERY FIRST <script> in the srcdoc (crReactSrcdoc,
+// below) — before the React-globals scripts and before the bundle script —
+// so window.onerror/onunhandledrejection are installed before anything else
+// in the frame can run, catching a synchronous top-level throw in the bundle
+// itself and any async error in the gap that would otherwise exist. Kept as
+// one string (not a template literal with real newlines mattering) since it
+// runs as classic inline JS inside the sandboxed srcdoc, same trick as
+// CR_ERROR_BOUNDARY_SRC above.
+function crBridgeScript(nonce) {
+  const token = JSON.stringify(String(nonce || ''))
+  return `
+(function () {
+  var TOKEN = ${token}
+  function post(msg) { try { parent.postMessage(msg, '*') } catch (e) {} }
+  function safe(v) {
+    try {
+      if (v instanceof Error) return v.stack || v.message
+      if (typeof v === 'object' && v !== null) return JSON.stringify(v)
+      return String(v)
+    } catch (e) { return String(v) }
+  }
+  window.onerror = function (message, source, lineno, colno, err) {
+    post({ type: 'cr-error', token: TOKEN, message: String(message), stack: err && err.stack, line: lineno, col: colno })
+  }
+  window.onunhandledrejection = function (event) {
+    var reason = event && event.reason
+    post({ type: 'cr-error', token: TOKEN, message: safe(reason), stack: reason && reason.stack })
+  }
+  // window.__crReportError: called by ErrorBoundary.componentDidCatch (React
+  // catches render errors itself; window.onerror never sees those).
+  window.__crReportError = function (error) {
+    post({ type: 'cr-error', token: TOKEN, message: safe(error), stack: error && error.stack })
+  }
+  ;['log', 'warn', 'error', 'info', 'debug'].forEach(function (level) {
+    var orig = console[level]
+    console[level] = function () {
+      var args = Array.prototype.slice.call(arguments).map(safe)
+      post({ type: 'cr-console', token: TOKEN, level: level, args: args })
+      return orig.apply(console, arguments)
+    }
+  })
+})();
+`
+}
+
+// srcdoc script tags can't contain a literal "</script" — the HTML tokenizer
+// matches it regardless of JS string/comment context, so bundle text built
+// from AI-authored artifact source could accidentally close the tag early.
+function crEscapeScriptClose(s) {
+  return String(s || '').replace(/<\/script/gi, '<\\/script')
+}
+
+// The preview iframe's document (spec §6.3): theme prelude + the Tailwind CSS
+// compiled in the renderer (crTailwind) + the iife bundle (crBundle), mounted
+// via React. `bundle`/`css` are handed in already-built by the caller; this
+// only inlines them, plus the React/ReactDOM globals the bootstrap needs (see
+// crVfsPlugin and CR_REACT_REQUIRE_SHIM above for why those can't just come
+// from the bundle itself). `nonce`/`injectRuntime` drive Task 22's error +
+// console bridge: when injectRuntime is set, crBridgeScript(nonce) is
+// spliced in as the VERY FIRST <script> — before the React-globals scripts,
+// before the bundle script, before the bootstrap — per the Task 21 review
+// finding that the bootstrap-tag splice point ran too late to catch a
+// synchronous top-level throw in the bundle or an async error in the gap
+// before window.onerror was patched.
+async function crReactSrcdoc({ bundle, css, nonce, injectRuntime }) {
+  const [reactSrc, reactDomBaseSrc, reactDomSrc] = await Promise.all([
+    crReactGlobalScript('react.js', 'React'),
+    crReactGlobalScript('react-dom.js', '__crReactDomBase'),
+    crReactGlobalScript('react-dom-client.js', 'ReactDOM'),
+  ])
+  const prelude = crThemePrelude()
+  const bridgeScript = injectRuntime ? `<script>${crBridgeScript(nonce)}</script>` : ''
+  return (
+    '<!doctype html><meta charset="utf-8">' +
+    bridgeScript +
+    prelude +
+    `<style>${css || ''}</style>` +
+    '<div id="root"></div>' +
+    `<script>${CR_REACT_REQUIRE_SHIM}</script>` +
+    `<script>${reactSrc}</script>` +
+    `<script>${reactDomBaseSrc}</script>` +
+    `<script>${reactDomSrc}</script>` +
+    `<script>${crEscapeScriptClose(bundle)}</script>` +
+    '<script>' +
+    CR_ERROR_BOUNDARY_SRC +
+    `
+try {
+  ReactDOM.createRoot(document.getElementById('root')).render(
+    React.createElement(ErrorBoundary, null, React.createElement(window.__CreatorArtifact.default))
+  )
+} catch (e) {
+  document.getElementById('root').textContent = 'Render error: ' + ((e && e.message) || e)
+}
+` +
+    '</script>'
   )
 }
 
@@ -1530,6 +1910,300 @@ function CrEditor() {
   })
 }
 
+// React artifact preview iframe (spec §6.3). `bundle`/`css`/`nonce`/
+// `injectRuntime` are handed straight to crReactSrcdoc (async, hence the
+// build-in-an-effect state below). Re-keyed on the bundle's content hash so a
+// bundle change remounts a fresh iframe rather than React trying to diff a
+// changed srcDoc in place (an iframe never re-evaluates a changed srcDoc).
+// `frameRef` (Task 22) is forwarded onto the <iframe> so a caller can pass it
+// straight to crUseFrameBridge(frameRef, nonce, …) to validate that incoming
+// postMessages come from THIS iframe, not any other window.
+function CrReactFrame({ bundle, css, nonce, injectRuntime, frameRef }) {
+  const [built, setBuilt] = useState(null) // {hash, srcDoc} | null while building
+
+  useEffect(() => {
+    let live = true
+    ;(async () => {
+      const hash = await crBundleHash(bundle || '')
+      const srcDoc = await crReactSrcdoc({ bundle, css, nonce, injectRuntime })
+      if (live) setBuilt({ hash, srcDoc })
+    })().catch((e) => {
+      if (live)
+        setBuilt({
+          hash: 'error',
+          srcDoc: `<!doctype html><pre style="color:#e5484d;padding:12px;white-space:pre-wrap">${
+            (e && e.message) || e
+          }</pre>`,
+        })
+    })
+    return () => {
+      live = false
+    }
+  }, [bundle, css, nonce, injectRuntime])
+
+  if (!built) return null
+  return jsx('iframe', {
+    key: built.hash,
+    ref: frameRef,
+    className: 'cr-frame',
+    sandbox: 'allow-scripts',
+    srcDoc: built.srcDoc,
+    title: 'React preview',
+  })
+}
+
+// Task 22 (spec §6.4): listens for the crBridgeScript postMessages from one
+// specific preview iframe and forwards validated cr-error/cr-console events
+// to the caller. Three checks gate every message before anything in it is
+// trusted: `event.source` pointing at exactly this iframe's contentWindow
+// (checked first — cheapest and most decisive, so a message from any other
+// frame/window is dropped before its shape is even inspected), known `type`,
+// and matching `token` (the nonce is the trust boundary — a message can only
+// carry the current build's nonce if it came from code crBridgeScript itself
+// installed). Every field read out of msg is still re-typed/clamped below —
+// a compromised artifact can call postMessage directly with a correct
+// type+token+source and an oversized or malformed payload, and that
+// shouldn't be able to bloat the console pane or hand a non-string into
+// rendering. A `console.error` call also feeds `onError` (in addition to
+// `onConsole`) so CrErrorStrip surfaces it exactly like a thrown error, per
+// the brief.
+function crUseFrameBridge(frameRef, nonce, { onError, onConsole } = {}) {
+  useEffect(() => {
+    const clampStr = (v, max) => String(v == null ? '' : v).slice(0, max)
+    function handler(event) {
+      if (event.source !== frameRef.current?.contentWindow) return
+      const msg = event.data
+      if (!msg || typeof msg !== 'object') return
+      if (msg.type !== 'cr-error' && msg.type !== 'cr-console') return
+      if (msg.token !== nonce) return
+
+      if (msg.type === 'cr-error') {
+        onError?.({
+          message: clampStr(msg.message, 2000),
+          stack: msg.stack ? clampStr(msg.stack, 4000) : null,
+          line: Number.isFinite(msg.line) ? msg.line : null,
+          col: Number.isFinite(msg.col) ? msg.col : null,
+        })
+      } else {
+        const level = ['log', 'warn', 'error', 'info', 'debug'].includes(msg.level) ? msg.level : 'log'
+        const args = Array.isArray(msg.args) ? msg.args.slice(0, 20).map((a) => clampStr(a, 500)) : []
+        onConsole?.({ level, args })
+        if (level === 'error') onError?.({ message: clampStr(args.join(' '), 2000), stack: null, line: null, col: null })
+      }
+    }
+    window.addEventListener('message', handler)
+    return () => window.removeEventListener('message', handler)
+  }, [frameRef, nonce, onError, onConsole])
+}
+
+// Latest render/runtime error surfaced above the preview frame (spec §6.4).
+// Purely controlled: the caller owns the error state (fed by crUseFrameBridge
+// / CrReactFrame's own build-error catch) and clears it — e.g. back to null
+// when a new build starts, or by keying this component on the bundle hash
+// like CrReactFrame keys its <iframe> — so a fixed artifact's next successful
+// mount drops the strip instead of it lingering.
+function CrErrorStrip({ error }) {
+  if (!error) return null
+  return jsx('div', {
+    style: {
+      padding: '6px 8px',
+      fontSize: 11,
+      lineHeight: 1.4,
+      color: '#e5484d',
+      background: 'rgba(229,72,77,0.1)',
+      borderBottom: '1px solid rgba(229,72,77,0.3)',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+    },
+    children: `Render error: ${error.message || error}`,
+  })
+}
+
+const CR_CONSOLE_COLORS = { error: '#e5484d', warn: '#f5a623', info: '#5b9dd9', log: 'inherit', debug: 'inherit' }
+
+// Plain <pre> console scrollback (spec §6.4). `event` is the latest single
+// cr-console message (a new object each time, from crUseFrameBridge's
+// onConsole) — appended to an internal ~300-line ring buffer on change, so
+// the caller doesn't have to lift the whole log into its own state. Clear
+// empties the buffer; a `console.error` line is colored the same as
+// CrErrorStrip so it reads as the same severity in both places.
+function CrConsolePane({ event }) {
+  const [entries, setEntries] = useState([])
+
+  useEffect(() => {
+    if (!event) return
+    setEntries((prev) => {
+      const next = prev.length >= 300 ? prev.slice(prev.length - 299) : prev.slice()
+      next.push(event)
+      return next
+    })
+  }, [event])
+
+  return jsxs('div', {
+    className: 'cr-cell',
+    style: { display: 'flex', flexDirection: 'column', minHeight: 0 },
+    children: [
+      jsx('div', {
+        style: {
+          display: 'flex',
+          justifyContent: 'flex-end',
+          padding: '2px 4px',
+          borderBottom: '1px solid rgba(128,128,128,0.15)',
+        },
+        children: jsx(Button, { size: 'xs', variant: 'ghost', disabled: !entries.length, onClick: () => setEntries([]), children: 'Clear' }),
+      }),
+      jsx('pre', {
+        style: {
+          flex: 1,
+          minHeight: 0,
+          overflow: 'auto',
+          margin: 0,
+          padding: '4px 8px',
+          fontSize: 11,
+          fontFamily: 'monospace',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        },
+        children: entries.map((e, i) =>
+          jsx(
+            'div',
+            { style: { color: CR_CONSOLE_COLORS[e.level] || 'inherit' }, children: `[${e.level}] ${e.args.join(' ')}` },
+            i,
+          ),
+        ),
+      }),
+    ],
+  })
+}
+
+// Build-error panel (Task 24, brief step 1): shown INSTEAD of the iframe
+// when crBundle fails — there's no bundle to run, so no iframe is attempted
+// at all.
+function CrDiagnostics({ errors }) {
+  return jsx('pre', {
+    className: 'cr-cell',
+    style: {
+      margin: 0,
+      padding: 12,
+      fontSize: 12,
+      fontFamily: 'monospace',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+      color: '#e5484d',
+    },
+    children: errors || 'Build failed.',
+  })
+}
+
+// crypto.randomUUID() is a platform global, no import needed. A fresh nonce
+// per build, tied to the same content-hash lifecycle as CrReactFrame's
+// remount key (crReactBuild below), so a stale iframe's postMessages can
+// never be mistaken for the current build's — crUseFrameBridge drops
+// anything whose token doesn't match the CURRENT nonce.
+function crNonce() {
+  return crypto.randomUUID()
+}
+
+// hash(source) -> {nonce, ok, code, css, errors}. crBundle and crTailwind
+// already cache by their own content hash (Tasks 19/20) — this adds one more
+// cache layer keyed the same way so that re-visiting an already-seen version
+// (version-stepping back and forth) reuses the SAME nonce too, not just a
+// skipped rebuild: CrReactFrame's key (the hash) and nonce both stay
+// identical, so there's no pointless iframe remount either.
+const crReactBuildCache = new Map()
+
+async function crReactBuild(source) {
+  const src = source || ''
+  const hash = await crBundleHash(src)
+  if (crReactBuildCache.has(hash)) return { hash, ...crReactBuildCache.get(hash) }
+  const result = await crBundle(src)
+  const built = result.ok
+    ? { nonce: crNonce(), ok: true, code: result.code, css: await crTailwind(result.code, null, src) }
+    : { nonce: crNonce(), ok: false, errors: result.errors }
+  // Bound the cache (review finding: unbounded Map of full bundle+CSS strings
+  // leaks memory across an editing session) — insertion-order eviction is
+  // enough since Map preserves it, no LRU bookkeeping needed.
+  if (crReactBuildCache.size >= 8) crReactBuildCache.delete(crReactBuildCache.keys().next().value)
+  crReactBuildCache.set(hash, built)
+  return { hash, ...built }
+}
+
+// React artifact preview (Task 24, spec §6.2-§6.4). Debounces `content`
+// (~400ms) before feeding crReactBuild, then either renders CrDiagnostics
+// (build failed — no iframe) or CrErrorStrip + CrReactFrame + CrConsolePane,
+// with the Task 22 bridge (crUseFrameBridge) wired to a real caller here:
+// its onError/onConsole feed this component's own error/console state, which
+// in turn are the props CrErrorStrip/CrConsolePane render.
+function CrReactPreview({ content }) {
+  const [debounced, setDebounced] = useState(content)
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(content), 400)
+    return () => clearTimeout(id)
+  }, [content])
+
+  const [build, setBuild] = useState(null) // {hash, nonce, ok, code?, css?, errors?} | null
+  // A rejected crReactBuild (e.g. a transient asset fetch failure) used to be
+  // an unhandled rejection: `build` just stayed null forever and this
+  // component silently rendered nothing. Surface it via CrDiagnostics instead.
+  const [buildError, setBuildError] = useState(null)
+  useEffect(() => {
+    let live = true
+    setBuildError(null)
+    crReactBuild(debounced || '').then(
+      (b) => {
+        if (live) setBuild(b)
+      },
+      (e) => {
+        if (live) setBuildError(e)
+      },
+    )
+    return () => {
+      live = false
+    }
+  }, [debounced])
+
+  const frameRef = useRef(null)
+  const [error, setError] = useState(null)
+  const [consoleEvent, setConsoleEvent] = useState(null)
+  const hash = build && build.hash
+
+  // Loose end (brief item 1): CrErrorStrip is purely controlled, so this IS
+  // its reset — clear back to null the moment a NEW content hash starts
+  // loading (same lifecycle CrReactFrame keys its remount on), so a fixed
+  // artifact's next successful build can't still be showing the old error.
+  useEffect(() => {
+    setError(null)
+  }, [hash])
+
+  // Loose end (brief item 2): the bridge's real caller. `nonce` is undefined
+  // until the first build resolves; the effect inside just re-subscribes
+  // once it's set, same as any other dependency change.
+  crUseFrameBridge(frameRef, build && build.nonce, { onError: setError, onConsole: setConsoleEvent })
+
+  if (buildError) return jsx(CrDiagnostics, { errors: String((buildError && buildError.message) || buildError) })
+  if (!build) return null
+  if (!build.ok) return jsx(CrDiagnostics, { errors: build.errors })
+
+  return jsxs('div', {
+    className: 'cr-cell',
+    style: { display: 'flex', flexDirection: 'column', minHeight: 0, padding: 0 },
+    children: [
+      jsx(CrErrorStrip, { error }),
+      jsx('div', {
+        style: { flex: 1, minHeight: 0, display: 'flex' },
+        children: jsx(CrReactFrame, {
+          bundle: build.code,
+          css: build.css,
+          nonce: build.nonce,
+          injectRuntime: true,
+          frameRef,
+        }),
+      }),
+      jsx(CrConsolePane, { event: consoleEvent }),
+    ],
+  })
+}
+
 // Per-type preview (spec §5.11 table). `code` has no preview — the editor is
 // the view.
 function CrPreview() {
@@ -1537,6 +2211,7 @@ function CrPreview() {
   const content = useValue(crContent$)
   const type = (detail && detail.type) || 'code'
   if (type === 'code') return null
+  if (type === 'react') return jsx(CrReactPreview, { content })
 
   let body
   if (type === 'markdown') {
