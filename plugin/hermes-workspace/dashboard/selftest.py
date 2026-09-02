@@ -260,6 +260,63 @@ def _selfcheck_cr_store() -> None:
     print("  cr_store._selfcheck ok")
 
 
+def _selfcheck_cr_tools() -> None:
+    """cr_tools.py's own agent-tool layer (_h_create/_h_update/_h_read, the
+    prompt-section assert, error mapping) — never run by this file before
+    Fix 6. Same explicit-path-load pattern as _selfcheck_cr_store(); cr_tools
+    does `try: from . import cr_store except ImportError: import cr_store`,
+    so cr_store's parent dir goes on sys.path first so the fallback import
+    resolves outside a package."""
+    import importlib.util
+    import sys
+    plugin_dir = os.path.join(os.path.dirname(__file__), "..")
+    if plugin_dir not in sys.path:
+        sys.path.insert(0, plugin_dir)
+    p = os.path.join(plugin_dir, "cr_tools.py")
+    s = importlib.util.spec_from_file_location("cr_tools_probe", p)
+    m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+    m._selfcheck()
+    print("  cr_tools._selfcheck ok")
+
+
+def _selfcheck_read_assistant_messages() -> None:
+    """_read_assistant_messages' real (non-monkeypatched) code path: a lazy
+    `from hermes_state import SessionDB` import, then flattening a couple of
+    realistic message shapes (str content, and list-of-text-block content)."""
+    import importlib.util
+    import sys
+    import types
+
+    class _FakeSessionDB:
+        def get_messages(self, session_id, include_compacted=True):
+            assert session_id == "sess-1" and include_compacted is True
+            return [
+                {"role": "user", "content": "hi there"},
+                {"role": "assistant", "content": "plain string reply"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "block one"},
+                    {"type": "text", "text": "block two"},
+                ]},
+            ]
+
+    fake_mod = types.ModuleType("hermes_state")
+    fake_mod.SessionDB = _FakeSessionDB
+    saved_mod = sys.modules.get("hermes_state")
+    sys.modules["hermes_state"] = fake_mod
+    try:
+        p = os.path.join(os.path.dirname(__file__), "..", "cr_store.py")
+        s = importlib.util.spec_from_file_location("cr_store_ram_probe", p)
+        m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        out = m._read_assistant_messages("sess-1")
+        assert out == ["plain string reply", "block one block two"], out
+    finally:
+        if saved_mod is None:
+            sys.modules.pop("hermes_state", None)
+        else:
+            sys.modules["hermes_state"] = saved_mod
+    print("  _read_assistant_messages real path ok")
+
+
 def _selfcheck_creator_http() -> None:
     import tempfile
     saved = os.environ.get("HERMES_HOME")
@@ -351,6 +408,8 @@ if __name__ == "__main__":
     _selfcheck_http_write()
     _selfcheck_http_write_edges()
     _selfcheck_cr_store()
+    _selfcheck_cr_tools()
+    _selfcheck_read_assistant_messages()
     _selfcheck_creator_http()
     _selfcheck_creator_defensive_mount()
     print("ok")
