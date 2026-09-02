@@ -1190,12 +1190,29 @@ const crLibCache = new Map()
 // 'creator-vfs' namespace and load from the vendored bundle text. Anything
 // else (a relative import, an unknown package) is left alone so esbuild's own
 // resolver fails it with a normal "could not resolve" diagnostic.
+//
+// react/react-dom/react-dom-client are the one exception: they're left
+// `external` instead of inlined. React's hooks read a dispatcher that
+// react-dom's *own* evaluated 'react' module instance sets — if this bundle
+// inlined its own private copy of react.js, that copy's dispatcher would
+// never get set by whatever ReactDOM later mounts it (crReactSrcdoc's
+// preview bootstrap runs react-dom-client.js as a separate script, outside
+// this bundle's closure), and every hook call would throw "Invalid hook
+// call". Leaving them external makes esbuild emit `__require("react")` etc.
+// in the iife output; crReactSrcdoc supplies a matching global `require()`
+// resolving to the SAME window.React/window.ReactDOM instance it boots, so
+// there is exactly one React module instance shared by the artifact and its
+// renderer. react/jsx-runtime stays inlined — it's stateless (Symbol.for-
+// keyed element objects only), so a per-bundle copy is harmless.
+const CR_REACT_EXTERNAL = new Set(['react', 'react-dom', 'react-dom/client'])
+
 function crVfsPlugin(manifest) {
   return {
     name: 'creator-vfs',
     setup(build) {
       build.onResolve({ filter: /.*/ }, (args) => {
         if (!Object.prototype.hasOwnProperty.call(manifest, args.path)) return null
+        if (CR_REACT_EXTERNAL.has(args.path)) return { path: args.path, external: true }
         return { path: args.path, namespace: 'creator-vfs' }
       })
       build.onLoad({ filter: /.*/, namespace: 'creator-vfs' }, async (args) => {
@@ -1473,6 +1490,105 @@ function crHtmlDoc(html) {
   )
 }
 
+// Vendored creator-libs files (spec §6.1) are zero-import ESM whose only
+// top-level statement is a trailing `export default <expr>;` (confirmed
+// against the committed build.mjs output) — turning that into a plain
+// assignment is enough to run the file as a classic (non-module) <script>
+// inside the sandboxed srcdoc iframe and expose it as a window global.
+async function crReactGlobalScript(assetFile, globalName) {
+  const src = await crAsset(assetFile)
+  const marker = 'export default '
+  const at = src.lastIndexOf(marker)
+  if (at === -1) throw new Error(`crReactGlobalScript(${assetFile}): no "${marker}" found`)
+  return src.slice(0, at) + `window.${globalName} = ` + src.slice(at + marker.length)
+}
+
+// react-dom.js/react-dom-client.js call a genuine runtime `require("react")`
+// / `require("react-dom")` internally (Facebook's own CJS sources, buried
+// inside factory closures esbuild can't statically hoist to an import) — this
+// is the global `require` those calls need, resolving to the SAME instances
+// crBundle's now-external react/react-dom/react-dom-client imports resolve
+// to (see crVfsPlugin), so there is exactly one shared React module.
+const CR_REACT_REQUIRE_SHIM = `
+function require(name) {
+  if (name === 'react') return window.React
+  if (name === 'react-dom') return window.__crReactDomBase
+  if (name === 'react-dom/client') return window.ReactDOM
+  throw new Error('crReactSrcdoc: require("' + name + '") is not available in the preview iframe')
+}
+`
+
+// Minimal inline ErrorBoundary (spec §6.3/§6.4) — wraps the artifact render so
+// a render-time error shows a fallback instead of leaving a blank frame.
+// componentDidCatch is a marked no-op: Task 22 wires it into the postMessage
+// error bridge (crBridgeScript).
+const CR_ERROR_BOUNDARY_SRC = `
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null } }
+  static getDerivedStateFromError(error) { return { error } }
+  componentDidCatch(error, info) { /* Task 22: crBridgeScript posts this */ }
+  render() {
+    if (this.state.error) {
+      return React.createElement('pre', {
+        style: { color: '#e5484d', padding: 12, margin: 0, whiteSpace: 'pre-wrap', fontSize: 12 },
+      }, 'Render error: ' + ((this.state.error && this.state.error.message) || this.state.error))
+    }
+    return this.props.children
+  }
+}
+`
+
+// srcdoc script tags can't contain a literal "</script" — the HTML tokenizer
+// matches it regardless of JS string/comment context, so bundle text built
+// from AI-authored artifact source could accidentally close the tag early.
+function crEscapeScriptClose(s) {
+  return String(s || '').replace(/<\/script/gi, '<\\/script')
+}
+
+// The preview iframe's document (spec §6.3): theme prelude + the Tailwind CSS
+// compiled in the renderer (crTailwind) + the iife bundle (crBundle), mounted
+// via React. `bundle`/`css` are handed in already-built by the caller; this
+// only inlines them, plus the React/ReactDOM globals the bootstrap needs (see
+// crVfsPlugin and CR_REACT_REQUIRE_SHIM above for why those can't just come
+// from the bundle itself). `nonce`/`injectRuntime` are Task 22's error+
+// console bridge placeholders: when injectRuntime is set, a marked splice
+// point is left for crBridgeScript(nonce); the bridge itself isn't wired yet.
+async function crReactSrcdoc({ bundle, css, nonce, injectRuntime }) {
+  const [reactSrc, reactDomBaseSrc, reactDomSrc] = await Promise.all([
+    crReactGlobalScript('react.js', 'React'),
+    crReactGlobalScript('react-dom.js', '__crReactDomBase'),
+    crReactGlobalScript('react-dom-client.js', 'ReactDOM'),
+  ])
+  const prelude = crThemePrelude()
+  const bridgePlaceholder = injectRuntime
+    ? `\n// Task 22 splices crBridgeScript(${JSON.stringify(nonce || '')}) here (error + console postMessage bridge, spec §6.4).\n`
+    : ''
+  return (
+    '<!doctype html><meta charset="utf-8">' +
+    prelude +
+    `<style>${css || ''}</style>` +
+    '<div id="root"></div>' +
+    `<script>${CR_REACT_REQUIRE_SHIM}</script>` +
+    `<script>${reactSrc}</script>` +
+    `<script>${reactDomBaseSrc}</script>` +
+    `<script>${reactDomSrc}</script>` +
+    `<script>${crEscapeScriptClose(bundle)}</script>` +
+    '<script>' +
+    CR_ERROR_BOUNDARY_SRC +
+    bridgePlaceholder +
+    `
+try {
+  ReactDOM.createRoot(document.getElementById('root')).render(
+    React.createElement(ErrorBoundary, null, React.createElement(window.__CreatorArtifact.default))
+  )
+} catch (e) {
+  document.getElementById('root').textContent = 'Render error: ' + ((e && e.message) || e)
+}
+` +
+    '</script>'
+  )
+}
+
 function crB64(s) {
   const bytes = new TextEncoder().encode(String(s || ''))
   let bin = ''
@@ -1707,6 +1823,44 @@ function CrEditor() {
         onChange: (e) => setBoth(e.target.value),
       }),
     ],
+  })
+}
+
+// React artifact preview iframe (spec §6.3). `bundle`/`css`/`nonce`/
+// `injectRuntime` are handed straight to crReactSrcdoc (async, hence the
+// build-in-an-effect state below). Re-keyed on the bundle's content hash so a
+// bundle change remounts a fresh iframe rather than React trying to diff a
+// changed srcDoc in place (an iframe never re-evaluates a changed srcDoc).
+function CrReactFrame({ bundle, css, nonce, injectRuntime }) {
+  const [built, setBuilt] = useState(null) // {hash, srcDoc} | null while building
+
+  useEffect(() => {
+    let live = true
+    ;(async () => {
+      const hash = await crBundleHash(bundle || '')
+      const srcDoc = await crReactSrcdoc({ bundle, css, nonce, injectRuntime })
+      if (live) setBuilt({ hash, srcDoc })
+    })().catch((e) => {
+      if (live)
+        setBuilt({
+          hash: 'error',
+          srcDoc: `<!doctype html><pre style="color:#e5484d;padding:12px;white-space:pre-wrap">${
+            (e && e.message) || e
+          }</pre>`,
+        })
+    })
+    return () => {
+      live = false
+    }
+  }, [bundle, css, nonce, injectRuntime])
+
+  if (!built) return null
+  return jsx('iframe', {
+    key: built.hash,
+    className: 'cr-frame',
+    sandbox: 'allow-scripts',
+    srcDoc: built.srcDoc,
+    title: 'React preview',
   })
 }
 
