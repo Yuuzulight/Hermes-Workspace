@@ -1,5 +1,0 @@
-kind: standalone
-provides_tools:
-  - create_artifact
-  - update_artifact
-  - read_artifact

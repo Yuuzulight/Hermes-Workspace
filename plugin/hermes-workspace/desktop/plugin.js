@@ -1226,34 +1226,3 @@ export default {
     })
   },
 }
-
-
-
-// CodeMirror 6 blob module loader for Hermes Workspace Creator
-function createBlobModule(url, type) {
-  return new Promise((resolve, reject) => {
-    const blob = new Blob([fetch(url).then(r => r.text())], { type });
-    const urlObj = URL.createObjectURL(blob);
-    
-    // Create a module-like object with exports
-    const moduleExports = {};
-    
-    // Load as ES module (CodeMirror 6 uses ES modules)
-    import(urlObj).then(
-      (mod) => { Object.assign(moduleExports, mod.default || mod); resolve(moduleExports); },
-      (err) => { URL.revokeObjectURL(urlObj); reject(err); }
-    );
-    
-    // Cleanup on timeout
-    setTimeout(() => {
-      if (!moduleExports.__loaded__) {
-        URL.revokeObjectURL(urlObj);
-      }
-    }, 30000);
-  });
-}
-
-// Register with Hermes runtime (called from renderer)
-window.HermesCreatorCodeMirror = {
-  load: createBlobModule,
-};
