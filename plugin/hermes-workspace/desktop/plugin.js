@@ -1254,6 +1254,53 @@ async function crBundle(source) {
   return result
 }
 
+// Renderer-side Tailwind compile (task-20, see creator-libs/tailwind-entry.js
+// and task-20-report.md for why the vendored `tailwind.js` wraps tailwindcss
+// v4's core `compile()` rather than `@tailwindcss/browser`). tailwind.js is a
+// real ESM (unlike esbuild.js's UMD build) so blob-importing it yields its
+// actual `compile` export directly, no globalThis fallback needed.
+let crTailwindLibPromise = null
+function crTailwindLib() {
+  if (crTailwindLibPromise) return crTailwindLibPromise
+  crTailwindLibPromise = (async () => {
+    const src = await crAsset('tailwind.js')
+    const blobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))
+    try {
+      return await import(blobUrl)
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+  })()
+  return crTailwindLibPromise
+}
+
+// Candidate extractor: tailwindcss v4's own scanner (@tailwindcss/oxide) is a
+// native/wasm package meant for scanning files, not a fit for an offline
+// browser bundle — so this is the regex sweep from the task-20 brief instead.
+const CR_CLASS_ATTR_RE = /class(?:Name)?\s*[:=]\s*["'`]([^"'`]+)/g
+function crExtractCandidates(bundleText) {
+  const candidates = new Set()
+  for (const m of bundleText.matchAll(CR_CLASS_ATTR_RE)) {
+    for (const token of m[1].split(/\s+/)) if (token) candidates.add(token)
+  }
+  return [...candidates]
+}
+
+const crTailwindCache = new Map() // sha256(candidates+themeBlock) -> css string
+
+// Preview Tailwind compile (spec task-20): extract class candidates out of a
+// bundled artifact's source text, compile against an optional @theme block.
+// Cached by content hash, same pattern as crBundle.
+async function crTailwind(bundleText, themeBlock) {
+  const candidates = crExtractCandidates(bundleText)
+  const hash = await crBundleHash(candidates.join(' ') + (themeBlock || ''))
+  if (crTailwindCache.has(hash)) return crTailwindCache.get(hash)
+  const { compile } = await crTailwindLib()
+  const css = await compile('@tailwind utilities;' + (themeBlock || ''), { candidates })
+  crTailwindCache.set(hash, css)
+  return css
+}
+
 const crSid$ = atom('') // focusedStoredSessionId at last poll ('' = no chat)
 const crOpen$ = atom(null) // open artifact identifier | null
 const crList$ = atom([]) // [{identifier,type,title,version,updated_at,origin,in_session}]
@@ -1880,6 +1927,26 @@ function crRegister(ctx) {
             kind: bad.ok ? 'warning' : 'info',
             message: bad.ok ? 'syntax-error fixture unexpectedly built ok' : `syntax-error fixture diagnostics:\n${bad.errors}`,
           })
+        },
+      },
+    },
+    {
+      // Temporary manual-test command for crTailwind (task-20 brief step 5,
+      // kept dev-gated per this file's Task 17 convention rather than
+      // removed). Expect the notification's CSS snippet to contain
+      // "grid-template-columns" and "--color-brand".
+      id: 'cr-palette-tailwind-smoke',
+      area: PALETTE_AREA,
+      data: {
+        id: 'hermes-workspace.creator-tailwind-smoke',
+        label: 'Creator: tailwind smoke test',
+        run: async () => {
+          const css = await crTailwind(
+            "<div className='grid grid-cols-[1fr_2fr] p-4'>",
+            '@theme { --color-brand: #0af; }',
+          )
+          const ok = css.includes('grid-template-columns') && css.includes('--color-brand')
+          host.notify({ kind: ok ? 'info' : 'warning', message: `tailwind fixture (${css.length} bytes):\n${css}` })
         },
       },
     },

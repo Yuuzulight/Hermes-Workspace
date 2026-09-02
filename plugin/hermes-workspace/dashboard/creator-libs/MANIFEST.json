@@ -96,5 +96,9 @@
   "class-variance-authority": {
     "file": "class-variance-authority.js",
     "subdeps": []
+  },
+  "tailwind": {
+    "file": "tailwind.js",
+    "subdeps": []
   }
 }

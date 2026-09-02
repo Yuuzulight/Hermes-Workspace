@@ -31,12 +31,17 @@ const LIBS = [
   { specifier: 'clsx', entryPoint: 'clsx', outfile: './clsx.js' },
   { specifier: 'tailwind-merge', entryPoint: 'tailwind-merge', outfile: './tailwind-merge.js' },
   { specifier: 'class-variance-authority', entryPoint: 'class-variance-authority', outfile: './class-variance-authority.js' },
+  // Not a passthrough bundle of the 'tailwindcss' package itself — a small
+  // wrapper (./tailwind-entry.js) exposing a candidate-driven compile()
+  // (see that file's header, and task-20-report.md, for why). The `.css`
+  // loader lets it import tailwindcss's theme.css as an inlined text string.
+  { specifier: 'tailwind', entryPoint: './tailwind-entry.js', outfile: './tailwind.js', loader: { '.css': 'text' } },
 ]
 
 const here = (p) => new URL(p, import.meta.url)
 
 const manifest = {}
-for (const { specifier, entryPoint, outfile } of LIBS) {
+for (const { specifier, entryPoint, outfile, loader } of LIBS) {
   const result = await esbuild.build({
     entryPoints: [entryPoint],
     bundle: true,
@@ -47,6 +52,7 @@ for (const { specifier, entryPoint, outfile } of LIBS) {
     outfile: fileURLToPath(here(outfile)),
     external: REACT_EXTERNAL,
     metafile: true,
+    ...(loader ? { loader } : {}),
   })
   // esbuild guarantees bundle:true inlines everything except `external`, so
   // the only imports that can survive are the shared React ones — read the
