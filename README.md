@@ -28,10 +28,23 @@ chat scrollback. The agent gets three tools:
 A **Creator** pane docks beside Knowledge: it lists artifacts, renders a live
 preview per type, and lets you step through and restore prior versions.
 
-**Phase 1 scope** — types `code`, `html`, `svg`, `markdown`, `mermaid`. No
-`react` support yet; that lands in Phase 2 along with a bundled preview
-runtime, an error/console strip, CodeMirror editing, export, and Gist
-publish.
+**Types** — `code`, `html`, `svg`, `markdown`, `mermaid`, and `react`: an
+artifact whose default export is a React component runs live in a sandboxed
+preview iframe, bundled per artifact with a real esbuild build and Tailwind
+compilation. A syntax error surfaces as inline diagnostics instead of a blank
+frame; a runtime error shows an error strip; `console.log`/`console.error`
+from the component surface in a console pane. Bundles and Tailwind output are
+cached by content hash, so re-stepping to an already-rendered version is
+instant.
+
+`creator-libs/` (`plugin/hermes-workspace/dashboard/creator-libs/`) vendors
+what the React runtime needs — esbuild-wasm plus 20 npm libraries and a
+Tailwind build, ~19 MB committed to the repo (not gitignored; only
+`creator-libs/node_modules/` is). It's rebuilt with
+`node plugin/hermes-workspace/dashboard/creator-libs/build.mjs` and checked
+with `node plugin/hermes-workspace/dashboard/creator-libs/verify.mjs` — see
+Development below. Still Phase 2: CodeMirror editing, standalone export, and
+Gist publish land in Phase 3.
 
 ## Requirements
 
@@ -43,7 +56,9 @@ publish.
 ## Install
 
 1. Copy `plugin/hermes-workspace/` into `~/.hermes/plugins/hermes-workspace/`
-   (`%LOCALAPPDATA%\hermes\plugins\hermes-workspace\` on Windows).
+   (`%LOCALAPPDATA%\hermes\plugins\hermes-workspace\` on Windows). The folder
+   is ~20 MB thanks to `creator-libs/`'s vendored esbuild + npm libraries —
+   ships as part of the copy, no separate install step.
 2. Run `hermes plugins enable hermes-workspace`. This adds the plugin to
    `plugins.enabled` in `~/.hermes/config.yaml` and enables the agent +
    dashboard halves of **both** Knowledge and Creator:
@@ -112,6 +127,15 @@ edit and Hermes hot-reloads it. Syntax-check it directly:
 node --check plugin/hermes-workspace/desktop/plugin.js
 ```
 
+`creator-libs/` is rebuilt and re-verified separately when its pinned
+versions change:
+
+```bash
+cd plugin/hermes-workspace/dashboard/creator-libs
+node build.mjs   # re-vendor esbuild-wasm + the npm libraries
+node verify.mjs  # check every vendored file loads and matches MANIFEST.json
+```
+
 ## Manual verification
 
 `selftest.py` and `node --check` cover everything scriptable without a real
@@ -127,3 +151,19 @@ install — walk this after any Creator change, per design-creator.md §9.2:
 - The artifact picker lists and switches between artifacts correctly.
 - Kill and restart the dashboard process while the pane is open, and confirm
   the pane retries gracefully instead of getting stuck or erroring out.
+
+Phase 2 (`type=react`), per design-creator.md §9.2:
+
+- A `react` artifact whose default export is a component runs in the
+  preview iframe.
+- A syntax error in the artifact shows inline diagnostics, not a blank or
+  broken frame.
+- A runtime error (thrown during render) shows the error strip instead of a
+  blank frame.
+- `console.log` / `console.error` calls in the component show up in the
+  console pane.
+- Arbitrary Tailwind utility classes render correctly in the preview.
+- Editing the artifact triggers a debounced re-render (not one rebuild per
+  keystroke).
+- Stepping the version stepper to an already-seen version is instant — served
+  from the bundle/Tailwind cache, not rebuilt.
