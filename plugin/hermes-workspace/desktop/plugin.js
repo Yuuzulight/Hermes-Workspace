@@ -1166,7 +1166,13 @@ function crEsbuild() {
       await esbuild.initialize({ wasmModule, worker: false })
     }
     return esbuild
-  })()
+  })().catch((e) => {
+    // Don't let a transient failure (e.g. an asset fetch blip) wedge every
+    // future call behind this same rejected promise — clear the memo so the
+    // next call retries fresh (README: "pane retries gracefully").
+    crEsbuildPromise = null
+    throw e
+  })
   return crEsbuildPromise
 }
 
@@ -1174,7 +1180,14 @@ function crEsbuild() {
 // crAsset already caches the raw text by name, this just parses it once.
 let crManifestPromise = null
 function crManifest() {
-  if (!crManifestPromise) crManifestPromise = crAsset('MANIFEST.json').then((text) => JSON.parse(text))
+  if (!crManifestPromise) {
+    crManifestPromise = crAsset('MANIFEST.json')
+      .then((text) => JSON.parse(text))
+      .catch((e) => {
+        crManifestPromise = null
+        throw e
+      })
+  }
   return crManifestPromise
 }
 
@@ -1216,7 +1229,15 @@ function crVfsPlugin(manifest) {
         return { path: args.path, namespace: 'creator-vfs' }
       })
       build.onLoad({ filter: /.*/, namespace: 'creator-vfs' }, async (args) => {
-        if (!crLibCache.has(args.path)) crLibCache.set(args.path, crAsset(manifest[args.path].file))
+        if (!crLibCache.has(args.path)) {
+          crLibCache.set(
+            args.path,
+            crAsset(manifest[args.path].file).catch((e) => {
+              crLibCache.delete(args.path)
+              throw e
+            }),
+          )
+        }
         return { contents: await crLibCache.get(args.path), loader: 'js' }
       })
     },
@@ -1232,20 +1253,17 @@ function crFormatBuildErrors(errors) {
     .join('\n')
 }
 
-const crBundleCache = new Map() // sha256(source) -> {ok:true,code} | {ok:false,errors}
-
 async function crBundleHash(source) {
   const bytes = new TextEncoder().encode(source)
   return crHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
 }
 
 // Preview build (spec §6.2 step 3): bundle `source` (a react-artifact module)
-// against the vendored library vfs. Cached by content hash — a repeat call
-// with identical source skips rebuilding entirely.
+// against the vendored library vfs. No cache of its own — its one caller,
+// crReactBuild, already memoizes by this exact same content hash
+// (crReactBuildCache) before ever calling in, so a second Map here would
+// just be a strict-subset duplicate that never gets a hit of its own.
 async function crBundle(source) {
-  const hash = await crBundleHash(source)
-  if (crBundleCache.has(hash)) return crBundleCache.get(hash)
-
   const [esbuild, manifest] = await Promise.all([crEsbuild(), crManifest()])
   let result
   try {
@@ -1267,7 +1285,6 @@ async function crBundle(source) {
     const errors = e && e.errors
     result = { ok: false, errors: errors && errors.length ? crFormatBuildErrors(errors) : String((e && e.message) || e) }
   }
-  crBundleCache.set(hash, result)
   return result
 }
 
@@ -1287,7 +1304,10 @@ function crTailwindLib() {
     } finally {
       URL.revokeObjectURL(blobUrl)
     }
-  })()
+  })().catch((e) => {
+    crTailwindLibPromise = null
+    throw e
+  })
   return crTailwindLibPromise
 }
 
@@ -1295,10 +1315,23 @@ function crTailwindLib() {
 // native/wasm package meant for scanning files, not a fit for an offline
 // browser bundle — so this is the regex sweep from the task-20 brief instead.
 const CR_CLASS_ATTR_RE = /class(?:Name)?\s*[:=]\s*["'`]([^"'`]+)/g
-function crExtractCandidates(bundleText) {
+
+// Broader sweep (review finding: cn()/clsx()/ternary/cva() className patterns
+// produce zero matches for CR_CLASS_ATTR_RE above, so the artifact renders
+// unstyled with no error). Every quoted string literal in the artifact's own
+// SOURCE — small, not the multi-MB bundle — split on whitespace and tossed in
+// as a candidate too. Tailwind's compile() silently drops anything that isn't
+// a real utility, so over-collecting costs nothing.
+const CR_STRING_LITERAL_RE = /["'`]([^"'`]{1,500})["'`]/g
+function crExtractCandidates(bundleText, sourceText) {
   const candidates = new Set()
   for (const m of bundleText.matchAll(CR_CLASS_ATTR_RE)) {
     for (const token of m[1].split(/\s+/)) if (token) candidates.add(token)
+  }
+  if (sourceText) {
+    for (const m of sourceText.matchAll(CR_STRING_LITERAL_RE)) {
+      for (const token of m[1].split(/\s+/)) if (token) candidates.add(token)
+    }
   }
   return [...candidates]
 }
@@ -1308,8 +1341,8 @@ const crTailwindCache = new Map() // sha256(candidates+themeBlock) -> css string
 // Preview Tailwind compile (spec task-20): extract class candidates out of a
 // bundled artifact's source text, compile against an optional @theme block.
 // Cached by content hash, same pattern as crBundle.
-async function crTailwind(bundleText, themeBlock) {
-  const candidates = crExtractCandidates(bundleText)
+async function crTailwind(bundleText, themeBlock, sourceText) {
+  const candidates = crExtractCandidates(bundleText, sourceText)
   const hash = await crBundleHash(candidates.join(' ') + (themeBlock || ''))
   if (crTailwindCache.has(hash)) return crTailwindCache.get(hash)
   const { compile } = await crTailwindLib()
@@ -2080,12 +2113,17 @@ function crNonce() {
 const crReactBuildCache = new Map()
 
 async function crReactBuild(source) {
-  const hash = await crBundleHash(source || '')
+  const src = source || ''
+  const hash = await crBundleHash(src)
   if (crReactBuildCache.has(hash)) return { hash, ...crReactBuildCache.get(hash) }
-  const result = await crBundle(source || '')
+  const result = await crBundle(src)
   const built = result.ok
-    ? { nonce: crNonce(), ok: true, code: result.code, css: await crTailwind(result.code, null) }
+    ? { nonce: crNonce(), ok: true, code: result.code, css: await crTailwind(result.code, null, src) }
     : { nonce: crNonce(), ok: false, errors: result.errors }
+  // Bound the cache (review finding: unbounded Map of full bundle+CSS strings
+  // leaks memory across an editing session) — insertion-order eviction is
+  // enough since Map preserves it, no LRU bookkeeping needed.
+  if (crReactBuildCache.size >= 8) crReactBuildCache.delete(crReactBuildCache.keys().next().value)
   crReactBuildCache.set(hash, built)
   return { hash, ...built }
 }
@@ -2104,11 +2142,21 @@ function CrReactPreview({ content }) {
   }, [content])
 
   const [build, setBuild] = useState(null) // {hash, nonce, ok, code?, css?, errors?} | null
+  // A rejected crReactBuild (e.g. a transient asset fetch failure) used to be
+  // an unhandled rejection: `build` just stayed null forever and this
+  // component silently rendered nothing. Surface it via CrDiagnostics instead.
+  const [buildError, setBuildError] = useState(null)
   useEffect(() => {
     let live = true
-    crReactBuild(debounced || '').then((b) => {
-      if (live) setBuild(b)
-    })
+    setBuildError(null)
+    crReactBuild(debounced || '').then(
+      (b) => {
+        if (live) setBuild(b)
+      },
+      (e) => {
+        if (live) setBuildError(e)
+      },
+    )
     return () => {
       live = false
     }
@@ -2132,6 +2180,7 @@ function CrReactPreview({ content }) {
   // once it's set, same as any other dependency change.
   crUseFrameBridge(frameRef, build && build.nonce, { onError: setError, onConsole: setConsoleEvent })
 
+  if (buildError) return jsx(CrDiagnostics, { errors: String((buildError && buildError.message) || buildError) })
   if (!build) return null
   if (!build.ok) return jsx(CrDiagnostics, { errors: build.errors })
 
@@ -2331,69 +2380,6 @@ function crRegister(ctx) {
           crScan()
             .then(() => host.notify({ kind: 'info', message: 'Rescanned' }))
             .catch((e) => host.notifyError(e, 'Rescan failed')),
-      },
-    },
-    {
-      id: 'cr-palette-smoke',
-      area: PALETTE_AREA,
-      data: {
-        id: 'hermes-workspace.creator-esbuild-smoke',
-        label: 'Creator: esbuild smoke test',
-        run: async () => {
-          const es = await crEsbuild()
-          const r = await es.build({
-            stdin: { contents: 'export default () => 42', loader: 'js' },
-            bundle: true,
-            format: 'iife',
-            globalName: '__Smoke',
-            write: false,
-          })
-          host.notify({ kind: 'info', message: `bundle ${r.outputFiles[0].text.length} bytes` })
-        },
-      },
-    },
-    {
-      // Temporary manual-test command for crBundle (spec §6.2 step 3, kept
-      // dev-gated per this file's Task 17 convention rather than removed).
-      id: 'cr-palette-bundle-smoke',
-      area: PALETTE_AREA,
-      data: {
-        id: 'hermes-workspace.creator-bundle-smoke',
-        label: 'Creator: bundle smoke test',
-        run: async () => {
-          const ok = await crBundle(
-            "import { LineChart } from 'recharts'\nexport default () => <LineChart/>",
-          )
-          host.notify({
-            kind: ok.ok ? 'info' : 'warning',
-            message: ok.ok ? `recharts fixture: ok, ${ok.code.length} bytes` : `recharts fixture failed:\n${ok.errors}`,
-          })
-          const bad = await crBundle('export default () => <div>(')
-          host.notify({
-            kind: bad.ok ? 'warning' : 'info',
-            message: bad.ok ? 'syntax-error fixture unexpectedly built ok' : `syntax-error fixture diagnostics:\n${bad.errors}`,
-          })
-        },
-      },
-    },
-    {
-      // Temporary manual-test command for crTailwind (task-20 brief step 5,
-      // kept dev-gated per this file's Task 17 convention rather than
-      // removed). Expect the notification's CSS snippet to contain
-      // "grid-template-columns" and "--color-brand".
-      id: 'cr-palette-tailwind-smoke',
-      area: PALETTE_AREA,
-      data: {
-        id: 'hermes-workspace.creator-tailwind-smoke',
-        label: 'Creator: tailwind smoke test',
-        run: async () => {
-          const css = await crTailwind(
-            "<div className='grid grid-cols-[1fr_2fr] p-4'>",
-            '@theme { --color-brand: #0af; }',
-          )
-          const ok = css.includes('grid-template-columns') && css.includes('--color-brand')
-          host.notify({ kind: ok ? 'info' : 'warning', message: `tailwind fixture (${css.length} bytes):\n${css}` })
-        },
       },
     },
   ])
