@@ -2043,6 +2043,118 @@ function CrConsolePane({ event }) {
   })
 }
 
+// Build-error panel (Task 24, brief step 1): shown INSTEAD of the iframe
+// when crBundle fails — there's no bundle to run, so no iframe is attempted
+// at all.
+function CrDiagnostics({ errors }) {
+  return jsx('pre', {
+    className: 'cr-cell',
+    style: {
+      margin: 0,
+      padding: 12,
+      fontSize: 12,
+      fontFamily: 'monospace',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+      color: '#e5484d',
+    },
+    children: errors || 'Build failed.',
+  })
+}
+
+// crypto.randomUUID() is a platform global, no import needed. A fresh nonce
+// per build, tied to the same content-hash lifecycle as CrReactFrame's
+// remount key (crReactBuild below), so a stale iframe's postMessages can
+// never be mistaken for the current build's — crUseFrameBridge drops
+// anything whose token doesn't match the CURRENT nonce.
+function crNonce() {
+  return crypto.randomUUID()
+}
+
+// hash(source) -> {nonce, ok, code, css, errors}. crBundle and crTailwind
+// already cache by their own content hash (Tasks 19/20) — this adds one more
+// cache layer keyed the same way so that re-visiting an already-seen version
+// (version-stepping back and forth) reuses the SAME nonce too, not just a
+// skipped rebuild: CrReactFrame's key (the hash) and nonce both stay
+// identical, so there's no pointless iframe remount either.
+const crReactBuildCache = new Map()
+
+async function crReactBuild(source) {
+  const hash = await crBundleHash(source || '')
+  if (crReactBuildCache.has(hash)) return { hash, ...crReactBuildCache.get(hash) }
+  const result = await crBundle(source || '')
+  const built = result.ok
+    ? { nonce: crNonce(), ok: true, code: result.code, css: await crTailwind(result.code, null) }
+    : { nonce: crNonce(), ok: false, errors: result.errors }
+  crReactBuildCache.set(hash, built)
+  return { hash, ...built }
+}
+
+// React artifact preview (Task 24, spec §6.2-§6.4). Debounces `content`
+// (~400ms) before feeding crReactBuild, then either renders CrDiagnostics
+// (build failed — no iframe) or CrErrorStrip + CrReactFrame + CrConsolePane,
+// with the Task 22 bridge (crUseFrameBridge) wired to a real caller here:
+// its onError/onConsole feed this component's own error/console state, which
+// in turn are the props CrErrorStrip/CrConsolePane render.
+function CrReactPreview({ content }) {
+  const [debounced, setDebounced] = useState(content)
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(content), 400)
+    return () => clearTimeout(id)
+  }, [content])
+
+  const [build, setBuild] = useState(null) // {hash, nonce, ok, code?, css?, errors?} | null
+  useEffect(() => {
+    let live = true
+    crReactBuild(debounced || '').then((b) => {
+      if (live) setBuild(b)
+    })
+    return () => {
+      live = false
+    }
+  }, [debounced])
+
+  const frameRef = useRef(null)
+  const [error, setError] = useState(null)
+  const [consoleEvent, setConsoleEvent] = useState(null)
+  const hash = build && build.hash
+
+  // Loose end (brief item 1): CrErrorStrip is purely controlled, so this IS
+  // its reset — clear back to null the moment a NEW content hash starts
+  // loading (same lifecycle CrReactFrame keys its remount on), so a fixed
+  // artifact's next successful build can't still be showing the old error.
+  useEffect(() => {
+    setError(null)
+  }, [hash])
+
+  // Loose end (brief item 2): the bridge's real caller. `nonce` is undefined
+  // until the first build resolves; the effect inside just re-subscribes
+  // once it's set, same as any other dependency change.
+  crUseFrameBridge(frameRef, build && build.nonce, { onError: setError, onConsole: setConsoleEvent })
+
+  if (!build) return null
+  if (!build.ok) return jsx(CrDiagnostics, { errors: build.errors })
+
+  return jsxs('div', {
+    className: 'cr-cell',
+    style: { display: 'flex', flexDirection: 'column', minHeight: 0, padding: 0 },
+    children: [
+      jsx(CrErrorStrip, { error }),
+      jsx('div', {
+        style: { flex: 1, minHeight: 0, display: 'flex' },
+        children: jsx(CrReactFrame, {
+          bundle: build.code,
+          css: build.css,
+          nonce: build.nonce,
+          injectRuntime: true,
+          frameRef,
+        }),
+      }),
+      jsx(CrConsolePane, { event: consoleEvent }),
+    ],
+  })
+}
+
 // Per-type preview (spec §5.11 table). `code` has no preview — the editor is
 // the view.
 function CrPreview() {
@@ -2050,6 +2162,7 @@ function CrPreview() {
   const content = useValue(crContent$)
   const type = (detail && detail.type) || 'code'
   if (type === 'code') return null
+  if (type === 'react') return jsx(CrReactPreview, { content })
 
   let body
   if (type === 'markdown') {
