@@ -58,7 +58,7 @@ TYPE_EXT = {
     "react": "jsx",
 }
 
-VALID_TYPES = ("code", "html", "svg", "markdown", "mermaid")  # Task 23 adds "react"
+VALID_TYPES = ("code", "html", "svg", "markdown", "mermaid", "react")
 TRUNCATION_NOTE = "… (full content in the artifact)"
 OVERSIZE_NOTE = "open the Creator pane for the full artifact"
 MAX_BYTES = 1_000_000  # §5.6 write cap, shared by the tool path and the HTTP path
@@ -970,6 +970,22 @@ def _selfcheck() -> None:
     assert ext_for("code", "python") == "py"
     assert ext_for("code", "brainfuck") == "txt"
     assert ext_for("react", None) == "jsx"
+
+    # Task 23: type: react
+    assert "react" in VALID_TYPES
+    saved = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            r = do_create({"identifier": "app", "type": "react", "title": "App",
+                           "content": "export default () => null"}, "s1")
+            assert r["version"] == 1 and r["type"] == "react"
+            assert do_read({"identifier": "app"})["content"] == "export default () => null"
+            dir_ = _meta("app")[0]
+            assert (_creator_dir() / dir_ / "v1.jsx").is_file()
+    finally:
+        if saved is None: os.environ.pop("HERMES_HOME", None)
+        else: os.environ["HERMES_HOME"] = saved
 
 
 if __name__ == "__main__":

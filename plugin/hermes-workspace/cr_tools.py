@@ -33,7 +33,14 @@ content in the artifact, not in your reply — a one-line pointer is enough.
 - `type=html` may be a full document or a fragment. `type=code` takes a
   `language`. Use `type=react` for an interactive component (Phase 2+).
 - Small snippets, inline examples, and command output stay in your reply as
-  normal code blocks."""
+  normal code blocks.
+
+For `type=react`: the content is a module whose default export is the
+component — charts, dashboards, anything stateful. You may import from:
+react, react-dom, recharts, lucide-react, d3, three + @react-three/fiber,
+papaparse, xlsx, mathjs, tone, @tanstack/react-table, lodash, date-fns,
+framer-motion, clsx, tailwind-merge, class-variance-authority. Tailwind
+classes are compiled per artifact."""
 
 
 # --- §5.7 tool schemas ---
@@ -133,6 +140,7 @@ def register(ctx) -> None:
 def _selfcheck() -> None:
     import tempfile
     assert len(PROMPT_SECTION) < 3900 and not PROMPT_SECTION.lstrip().startswith("#")
+    assert "react" in SCHEMAS["create_artifact"]["parameters"]["properties"]["type"]["enum"]
     saved = os.environ.get("HERMES_HOME")
     try:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
