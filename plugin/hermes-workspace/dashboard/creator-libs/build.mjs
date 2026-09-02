@@ -36,6 +36,10 @@ const LIBS = [
   // (see that file's header, and task-20-report.md, for why). The `.css`
   // loader lets it import tailwindcss's theme.css as an inlined text string.
   { specifier: 'tailwind', entryPoint: './tailwind-entry.js', outfile: './tailwind.js', loader: { '.css': 'text' } },
+  // Facade over @codemirror/{state,view,commands,language,search,autocomplete}
+  // + lang-{javascript,html,css,python,markdown} + the one-dark theme (see
+  // ./codemirror-entry.js header). No React dependency, so nothing external.
+  { specifier: 'codemirror', entryPoint: './codemirror-entry.js', outfile: './codemirror.js' },
 ]
 
 const here = (p) => new URL(p, import.meta.url)

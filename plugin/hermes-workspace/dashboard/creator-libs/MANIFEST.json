@@ -100,5 +100,9 @@
   "tailwind": {
     "file": "tailwind.js",
     "subdeps": []
+  },
+  "codemirror": {
+    "file": "codemirror.js",
+    "subdeps": []
   }
 }
