@@ -251,9 +251,106 @@ def _selfcheck_http_write_edges() -> None:
     print("  http write edges ok")
 
 
+def _selfcheck_cr_store() -> None:
+    import importlib.util
+    p = os.path.join(os.path.dirname(__file__), "..", "cr_store.py")
+    s = importlib.util.spec_from_file_location("cr_store_probe", p)
+    m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+    m._selfcheck()
+    print("  cr_store._selfcheck ok")
+
+
+def _selfcheck_creator_http() -> None:
+    import tempfile
+    saved = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            import cr_api
+            cr_api.cr_store._scan_seen.clear()
+            from fastapi import FastAPI
+            from fastapi.testclient import TestClient
+            app = FastAPI(); app.include_router(cr_api.router)
+            c = TestClient(app)
+            r = c.post("/creator/artifacts/my-doc/versions", json={"content": "# v1"})
+            assert r.status_code == 404  # create is a tool path, not HTTP; see note
+            # seed via cr_store directly, then exercise HTTP
+            cr_api.cr_store.do_create({"identifier": "my-doc", "type": "markdown",
+                                       "title": "Doc", "content": "# v1"}, "sess-1")
+            lst = c.get("/creator/artifacts?session_id=sess-1").json()["artifacts"]
+            assert lst and lst[0]["identifier"] == "my-doc" and lst[0]["in_session"]
+            assert c.get("/creator/artifacts/my-doc/v/1").json()["content"] == "# v1"
+            v2 = c.post("/creator/artifacts/my-doc/versions", json={"content": "# v2"}).json()
+            assert v2["version"] == 2
+            g = c.get("/creator/artifacts/my-doc").json()
+            assert g["versions"][1]["source"] == "user-edit"
+            rest = c.post("/creator/artifacts/my-doc/versions", json={"restore_from": 1}).json()
+            assert rest["action"] == "restored"
+            assert c.get("/creator/artifacts/my-doc/v/3").json()["content"] == "# v1"
+            assert c.post("/creator/artifacts/my-doc/versions",
+                          json={"content": "x" * 1_000_001}).status_code == 400
+            assert c.delete("/creator/artifacts/my-doc").json()["ok"]
+            assert c.get("/creator/artifacts/my-doc").status_code == 404
+            # config
+            assert c.post("/creator/config", json={"github_token": "t"}).json()["github_token_set"]
+            # defensive mount: a broken cr_api import must not unmount hw_* routes
+            import plugin_api, importlib
+            assert any(r.path == "/status" for r in plugin_api.router.routes)
+    finally:
+        if saved is None: os.environ.pop("HERMES_HOME", None)
+        else: os.environ["HERMES_HOME"] = saved
+    print("  creator http round-trip ok")
+
+
+def _selfcheck_creator_defensive_mount() -> None:
+    """A throw from `import cr_api` must leave every hw_* route mounted and log a warning."""
+    import builtins
+    import importlib
+    import logging
+    import plugin_api
+
+    def _paths(mod) -> set:
+        from fastapi import FastAPI
+        app = FastAPI()
+        app.include_router(mod.router)
+        return set(app.openapi()["paths"])
+
+    real_import = builtins.__import__
+
+    def _no_cr_api(name, *a, **k):
+        if name == "cr_api":
+            raise ImportError("selftest: cr_api forced unavailable")
+        return real_import(name, *a, **k)
+
+    logger = logging.getLogger("plugin_api")
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.setLevel(0)
+    handler.emit = records.append
+    logger.addHandler(handler)
+    try:
+        builtins.__import__ = _no_cr_api
+        importlib.reload(plugin_api)
+        broken = _paths(plugin_api)
+        assert "/status" in broken, "hw_* routes lost when cr_api import failed"
+        assert not any(p.startswith("/creator") for p in broken), broken
+        assert any("creator API not mounted" in rec.getMessage()
+                   for rec in records), [rec.getMessage() for rec in records]
+    finally:
+        builtins.__import__ = real_import
+        logger.removeHandler(handler)
+        importlib.reload(plugin_api)  # restore a clean, fully-wired plugin_api
+    restored = _paths(plugin_api)
+    assert "/status" in restored and "/creator/config" in restored, restored
+    print("  creator defensive mount ok")
+
+
 if __name__ == "__main__":
     run_module_checks()
     _selfcheck_http_read()
     _selfcheck_http_write()
     _selfcheck_http_write_edges()
+    _selfcheck_cr_store()
+    _selfcheck_creator_http()
+    _selfcheck_creator_defensive_mount()
     print("ok")

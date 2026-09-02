@@ -106,5 +106,4 @@ def read_config():
 @router.post("/config")
 @_guard
 def write_config(body: ConfigBody):
-    cr_store.set_config(body.model_dump(exclude_unset=True))
-    return {"ok": True}
+    return cr_store.set_config(body.model_dump(exclude_unset=True))
