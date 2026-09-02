@@ -431,7 +431,7 @@ def restore(identifier, n, session_id) -> dict:
     normalize-equal to latest → unchanged; else a new version, source='restore'."""
     v = get_version(identifier, n)
     cur = latest(identifier)
-    if cur and sha256_of(v["content"]) == cur["sha256"]:
+    if sha256_of(v["content"]) == cur["sha256"]:
         record_session(identifier, session_id)
         return {"action": "unchanged", "version": cur["version"]}
     r = add_version(identifier, type_=cur["type"], title=cur["title"],
@@ -489,7 +489,8 @@ def delete_artifact(identifier) -> None:
             return
         d = _creator_dir() / row[0]
         base = _creator_dir()
-        assert os.path.realpath(d).startswith(os.path.realpath(base) + os.sep), d
+        if not os.path.realpath(d).startswith(os.path.realpath(base) + os.sep):
+            raise StoreBadInput("refusing to delete outside creator dir")
         conn.execute("DELETE FROM artifacts WHERE identifier = ?", (identifier,))
     finally:
         conn.close()
@@ -608,9 +609,6 @@ def _selfcheck() -> None:
             assert ga["version_count"] == 5 and ga["versions"][-1]["source"] == "restore" \
                 and ga["versions"][-1]["restored_from"] == 1
             # missing-file -> StoreGone
-            (_creator_dir() / ga["identifier"] if False else None)
-            import os as _os
-            _os.remove(_creator_dir() / list_artifacts(None)[0]["identifier"] / "v1.md") if False else None
             delete_artifact("doc")
             try:
                 get_artifact("doc"); assert False
