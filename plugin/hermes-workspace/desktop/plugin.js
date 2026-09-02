@@ -1816,6 +1816,32 @@ function CrHeader() {
   })
 }
 
+// Maps an artifact's type/language (cr_store.py's VALID_TYPES / LANG_EXT,
+// task-4) to one of codemirror-entry.js's LANGS keys (javascript/html/css/
+// python/markdown, task-26). 'react' -> 'javascript': that key's javascript()
+// call is built with {jsx: true, typescript: true} unconditionally (see
+// codemirror-entry.js), so JSX highlighting comes for free without a
+// separate jsx/tsx key. 'markdown'/'mermaid' artifacts both get 'markdown'
+// highlighting (mermaid is fenced text with no dedicated CM6 mode here — a
+// reasonable approximation over no highlighting at all). 'svg' and anything
+// else unrecognized (json/sql/go/rust/bash/...) fall back to null, which
+// basicExtensions already treats as "no language extension" (task-27).
+function crCmLanguageFor(type, language) {
+  if (type === 'html') return 'html'
+  if (type === 'react') return 'javascript'
+  if (type === 'markdown' || type === 'mermaid') return 'markdown'
+  if (type === 'code') {
+    const lang = (language || '').toLowerCase()
+    if (['javascript', 'js', 'typescript', 'ts', 'jsx', 'tsx'].includes(lang)) return 'javascript'
+    if (lang === 'css') return 'css'
+    if (lang === 'python' || lang === 'py') return 'python'
+    if (lang === 'html') return 'html'
+    if (lang === 'markdown' || lang === 'md') return 'markdown'
+    return null
+  }
+  return null
+}
+
 function CrEditor() {
   const content = useValue(crContent$)
   const detail = useValue(crDetail$)
@@ -1826,6 +1852,7 @@ function CrEditor() {
   const baseRef = useRef(content)
   const count = (detail && detail.version_count) || 1
   const readOnly = vv != null && vv < count
+  const cmLanguage = crCmLanguageFor(detail && detail.type, detail && detail.language)
 
   useEffect(() => {
     setDraft(content)
@@ -1849,26 +1876,6 @@ function CrEditor() {
       })
       .catch((e) => host.notifyError?.(e, 'Save failed'))
       .finally(() => crBusy$.set(false))
-  }
-  const onKeyDown = (e) => {
-    if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
-      e.preventDefault()
-      save()
-      return
-    }
-    if (e.key === 'Tab' && !readOnly) {
-      e.preventDefault()
-      const el = e.target
-      const s = el.selectionStart
-      const en = el.selectionEnd
-      const next = draft.slice(0, s) + '  ' + draft.slice(en)
-      setBoth(next)
-      requestAnimationFrame(() => {
-        try {
-          el.selectionStart = el.selectionEnd = s + 2
-        } catch {}
-      })
-    }
   }
 
   return jsxs('div', {
@@ -1896,15 +1903,15 @@ function CrEditor() {
           jsx(Button, { size: 'xs', disabled: readOnly || !dirty || busy, onClick: save, children: 'Save' }),
         ],
       }),
-      jsx(Textarea, {
-        className:
-          'block w-full resize-none rounded-none border-0 bg-transparent p-2.5 font-mono text-xs leading-relaxed shadow-none focus-visible:ring-0',
-        style: { flex: 1, minHeight: 140 },
-        value: draft,
-        readOnly,
-        spellCheck: false,
-        onKeyDown,
-        onChange: (e) => setBoth(e.target.value),
+      jsx('div', {
+        style: { flex: 1, minHeight: 140, overflow: 'auto' },
+        children: jsx(CrCmEditor, {
+          value: draft,
+          language: cmLanguage,
+          readOnly,
+          onChange: setBoth,
+          onSave: save,
+        }),
       }),
     ],
   })
