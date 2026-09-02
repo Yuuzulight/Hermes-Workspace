@@ -1922,24 +1922,27 @@ function CrReactFrame({ bundle, css, nonce, injectRuntime, frameRef }) {
 // Task 22 (spec §6.4): listens for the crBridgeScript postMessages from one
 // specific preview iframe and forwards validated cr-error/cr-console events
 // to the caller. Three checks gate every message before anything in it is
-// trusted: known `type`, matching `token` (the nonce is the trust boundary —
-// a message can only carry the current build's nonce if it came from code
-// crBridgeScript itself installed), and `event.source` pointing at exactly
-// this iframe's contentWindow (so another frame/window posting to the parent
-// can't spoof one, even with a stale/reused nonce). Every field read out of
-// msg is still re-typed/clamped below — a compromised artifact can call
-// postMessage directly with a correct type+token+source and an oversized or
-// malformed payload, and that shouldn't be able to bloat the console pane or
-// hand a non-string into rendering.
+// trusted: `event.source` pointing at exactly this iframe's contentWindow
+// (checked first — cheapest and most decisive, so a message from any other
+// frame/window is dropped before its shape is even inspected), known `type`,
+// and matching `token` (the nonce is the trust boundary — a message can only
+// carry the current build's nonce if it came from code crBridgeScript itself
+// installed). Every field read out of msg is still re-typed/clamped below —
+// a compromised artifact can call postMessage directly with a correct
+// type+token+source and an oversized or malformed payload, and that
+// shouldn't be able to bloat the console pane or hand a non-string into
+// rendering. A `console.error` call also feeds `onError` (in addition to
+// `onConsole`) so CrErrorStrip surfaces it exactly like a thrown error, per
+// the brief.
 function crUseFrameBridge(frameRef, nonce, { onError, onConsole } = {}) {
   useEffect(() => {
     const clampStr = (v, max) => String(v == null ? '' : v).slice(0, max)
     function handler(event) {
+      if (event.source !== frameRef.current?.contentWindow) return
       const msg = event.data
       if (!msg || typeof msg !== 'object') return
       if (msg.type !== 'cr-error' && msg.type !== 'cr-console') return
       if (msg.token !== nonce) return
-      if (event.source !== frameRef.current?.contentWindow) return
 
       if (msg.type === 'cr-error') {
         onError?.({
@@ -1952,6 +1955,7 @@ function crUseFrameBridge(frameRef, nonce, { onError, onConsole } = {}) {
         const level = ['log', 'warn', 'error', 'info', 'debug'].includes(msg.level) ? msg.level : 'log'
         const args = Array.isArray(msg.args) ? msg.args.slice(0, 20).map((a) => clampStr(a, 500)) : []
         onConsole?.({ level, args })
+        if (level === 'error') onError?.({ message: clampStr(args.join(' '), 2000), stack: null, line: null, col: null })
       }
     }
     window.addEventListener('message', handler)
