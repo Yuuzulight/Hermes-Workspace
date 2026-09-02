@@ -1673,27 +1673,51 @@ try {
   )
 }
 
+// Shared by crExport and crPublish (Task 32): assembles a standalone,
+// bridge-free react doc from the same crBundle/crTailwind pieces the live
+// preview (crReactBuild) uses. crReactSrcdoc splices crBridgeScript (the
+// postMessage bridge to the pane) only when its `injectRuntime` param is
+// truthy, so calling it here with no `nonce`/`injectRuntime` already yields
+// a bridge-free, fully standalone doc (theme prelude + css + bundle + the
+// same ErrorBoundary bootstrap the preview uses).
+async function crAssembleReactHtml(source) {
+  const built = await crBundle(source)
+  if (!built.ok) return { ok: false, errors: built.errors }
+  const css = await crTailwind(built.code, null, source)
+  const html = await crReactSrcdoc({ bundle: built.code, css })
+  return { ok: true, html }
+}
+
 // Standalone export (spec §7.2). Non-react types are wrapped server-side;
-// react is assembled here from the same crBundle/crTailwind pieces the live
-// preview (crReactBuild) uses, then persisted via the /export/bundle route.
-// crReactSrcdoc splices crBridgeScript (the postMessage bridge to the pane)
-// only when its `injectRuntime` param is truthy — confirmed by reading its
-// current body, it's still conditional, not spliced unconditionally. So
-// calling it here with no `nonce`/`injectRuntime` already yields a bridge-
-// free, fully standalone doc (theme prelude + css + bundle + the same
-// ErrorBoundary bootstrap the preview uses) — no separate assembly function
-// needed to satisfy "no compiler/bridge script".
+// react is assembled via crAssembleReactHtml, then persisted via the
+// /export/bundle route.
 async function crExport(id, detail, source) {
   if (detail && detail.type === 'react') {
-    const built = await crBundle(source)
-    if (!built.ok) return { ok: false, errors: built.errors }
-    const css = await crTailwind(built.code, null, source)
-    const html = await crReactSrcdoc({ bundle: built.code, css })
-    const r = await crApi(crPath(id, '/export/bundle'), { method: 'POST', body: { html } })
+    const assembled = await crAssembleReactHtml(source)
+    if (!assembled.ok) return { ok: false, errors: assembled.errors }
+    const r = await crApi(crPath(id, '/export/bundle'), { method: 'POST', body: { html: assembled.html } })
     return { ok: true, path: r.path }
   }
   const r = await crApi(crPath(id, '/export'), { method: 'POST', body: {} })
   return { ok: true, path: r.path }
+}
+
+// Publish to Gist (spec §7.3, task-31's POST .../publish). Non-react types
+// are exported+published server-side (no html sent); react sends the same
+// assembled doc crExport writes to disk, so the gist and the exported file
+// are byte-identical. Passes the backend's response through verbatim —
+// {url, raw_url} on success, {error: 'github_not_configured', how} or
+// {error: 'needs_pane'} on expected/recoverable failures (task-31 design;
+// the 'errors' key below is this function's own client-side bundle-failure
+// case, kept distinct from the server's 'error' key so the UI can tell a
+// local bundle failure apart from a server-reported condition).
+async function crPublish(id, detail, source) {
+  if (detail && detail.type === 'react') {
+    const assembled = await crAssembleReactHtml(source)
+    if (!assembled.ok) return { errors: assembled.errors }
+    return crApi(crPath(id, '/publish'), { method: 'POST', body: { html: assembled.html } })
+  }
+  return crApi(crPath(id, '/publish'), { method: 'POST', body: {} })
 }
 
 function crB64(s) {
@@ -1751,6 +1775,7 @@ function CrHeader() {
   const busy = useValue(crBusy$)
   const [confirm, setConfirm] = useState(false)
   const [exportResult, setExportResult] = useState(null) // {path} | {errors} | null
+  const [publishResult, setPublishResult] = useState(null) // {url,raw_url} | {error,how} | {error:'needs_pane'} | {errors} | null
   const count = (detail && detail.version_count) || 1
   const n = vv == null ? count : vv
 
@@ -1761,6 +1786,15 @@ function CrHeader() {
     crExport(open, detail, crContent$.get())
       .then(setExportResult)
       .catch((e) => host.notifyError?.(e, 'Export failed'))
+      .finally(() => crBusy$.set(false))
+  }
+  const doPublish = () => {
+    if (!open) return
+    setPublishResult(null)
+    crBusy$.set(true)
+    crPublish(open, detail, crContent$.get())
+      .then(setPublishResult)
+      .catch((e) => host.notifyError?.(e, 'Publish failed'))
       .finally(() => crBusy$.set(false))
   }
   // Calls crCtx.os[method](path) — NOT a detached `crCtx.os.revealPath` reference,
@@ -1856,6 +1890,7 @@ function CrHeader() {
           },
         }),
         jsx(Button, { size: 'xs', variant: 'ghost', disabled: !open || busy, onClick: doExport, children: 'Export' }),
+        jsx(Button, { size: 'xs', variant: 'ghost', disabled: !open || busy, onClick: doPublish, children: 'Publish' }),
       ],
     }),
     exportResult
@@ -1889,6 +1924,52 @@ function CrHeader() {
                   size: 'xs',
                   variant: 'ghost',
                   onClick: () => tryOsAction('openExternal', exportResult.path, 'Open in browser'),
+                  children: 'Open in browser',
+                }),
+              ],
+        })
+      : null,
+    publishResult
+      ? jsxs('div', {
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '4px 8px',
+            borderBottom: '1px solid rgba(128,128,128,0.15)',
+            flexWrap: 'wrap',
+            fontSize: 11,
+          },
+          children: publishResult.errors
+            ? [
+                jsx('span', {
+                  style: { color: '#e5484d', whiteSpace: 'pre-wrap' },
+                  children: `Publish failed: ${publishResult.errors}`,
+                }),
+              ]
+            : publishResult.error === 'github_not_configured'
+            ? [
+                jsx('span', {
+                  style: { opacity: 0.7 },
+                  children: publishResult.how || 'GitHub CLI (gh) is not configured for publishing.',
+                }),
+              ]
+            : publishResult.error === 'needs_pane'
+            ? [
+                jsx('span', {
+                  style: { opacity: 0.7 },
+                  children: 'Publish needs the rendered content — try again.',
+                }),
+              ]
+            : publishResult.error
+            ? [jsx('span', { style: { color: '#e5484d' }, children: `Publish failed: ${publishResult.error}` })]
+            : [
+                jsx('span', { style: { opacity: 0.7 }, children: `Published: ${publishResult.url}` }),
+                jsx(CopyButton, { appearance: 'icon', text: () => publishResult.url, title: 'Copy URL' }),
+                jsx(Button, {
+                  size: 'xs',
+                  variant: 'ghost',
+                  onClick: () => tryOsAction('openExternal', publishResult.url, 'Open in browser'),
                   children: 'Open in browser',
                 }),
               ],
