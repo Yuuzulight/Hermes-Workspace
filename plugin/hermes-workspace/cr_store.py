@@ -440,6 +440,22 @@ def restore(identifier, n, session_id) -> dict:
     return {"action": "restored", "version": r["version"]}
 
 
+def edit_version(identifier, content) -> dict:
+    """Pane user-edit write (§5.10 `POST /versions {content}`). Like do_update but
+    `source='user-edit'` and a slim result; no session link (the pane has none)."""
+    if content is None:
+        raise StoreBadInput("edit_version requires content")
+    prev = latest(identifier)
+    if prev is None:
+        raise StoreNotFound(f"no artifact '{identifier}'")
+    if sha256_of(content) == prev["sha256"]:
+        return {"identifier": identifier, "version": prev["version"], "action": "unchanged"}
+    r = add_version(identifier, type_=prev["type"], title=prev["title"],
+                    language=prev["language"], content=content, origin="tool",
+                    source="user-edit", session_id="")
+    return {"identifier": identifier, "version": r["version"], "action": "updated"}
+
+
 def list_artifacts(session_id: str | None) -> list[dict]:
     """Every artifact with its latest version (§5.10 `GET /artifacts`). In-session
     artifacts first, then by `updated_at` desc. session_id=None → all in_session=False."""
@@ -808,6 +824,10 @@ def _selfcheck() -> None:
             ga = get_artifact("doc")
             assert ga["version_count"] == 5 and ga["versions"][-1]["source"] == "restore" \
                 and ga["versions"][-1]["restored_from"] == 1
+            # Task 11: edit_version — user-edit source, slim result, no-op detect
+            assert edit_version("doc", "pane edit") == {"identifier": "doc", "version": 6, "action": "updated"}
+            assert edit_version("doc", "pane edit")["action"] == "unchanged"
+            assert get_artifact("doc")["versions"][-1]["source"] == "user-edit"
             # missing-file -> StoreGone
             delete_artifact("doc")
             try:
