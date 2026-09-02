@@ -1130,6 +1130,11 @@ const crViewVersion$ = atom(null) // viewed version n | null = latest
 const crDirty$ = atom(false) // editor has unsaved edits
 const crBusy$ = atom(false) // a write is in flight
 const crPinned$ = atom(false) // user picked from the <select> — stop auto-following
+const crVersionGone$ = atom(false) // last /v/{n} fetch 404/410'd — show a message, not stale content
+
+// Dedup /v/{n} refetches across poll ticks: skip the fetch when neither the
+// artifact's updated_at nor the viewed version number changed since last time.
+let crLastFetch = { id: null, updatedAt: null, n: null }
 
 const crPath = (id, rest) => `/creator/artifacts/${encodeURIComponent(id)}${rest || ''}`
 
@@ -1162,7 +1167,10 @@ async function crPoll() {
 
   let open = crOpen$.get()
   const stillThere = open && list.some((a) => a.identifier === open)
-  if (!stillThere || !crPinned$.get()) {
+  // Never auto-switch/reset out from under an unsaved draft (spec §5.10):
+  // a dirty editor keeps showing what it has, even if the pane isn't pinned
+  // or the open artifact dropped out of the list.
+  if ((!stillThere || !crPinned$.get()) && !crDirty$.get()) {
     const next = list.length ? list[0].identifier : null
     if (next !== open) {
       open = next
@@ -1196,8 +1204,28 @@ async function crPoll() {
   if (crDirty$.get()) return // don't clobber active edits
   const count = detail.version_count || 1
   const n = crViewVersion$.get() == null ? count : crViewVersion$.get()
-  const v = await crApi(crPath(open, `/v/${n}`))
-  crContent$.set((v && v.content) || '')
+
+  // Nothing changed since the last successful (or 404/410'd) fetch of this
+  // exact artifact+version — skip re-downloading up to 1MB of content.
+  const unchanged =
+    crLastFetch.id === open && crLastFetch.updatedAt === detail.updated_at && crLastFetch.n === n
+  if (unchanged) return
+
+  try {
+    const v = await crApi(crPath(open, `/v/${n}`))
+    crVersionGone$.set(false)
+    crContent$.set((v && v.content) || '')
+  } catch (e) {
+    // 404/410 (StoreGone) → the version row/file is gone; stop showing stale
+    // content and stop silently retrying every tick (spec §5.10/§3.4).
+    if (/\b(404|410)\b/.test(String((e && e.message) || e))) {
+      crVersionGone$.set(true)
+      crContent$.set('')
+    } else {
+      throw e
+    }
+  }
+  crLastFetch = { id: open, updatedAt: detail.updated_at, n }
 }
 
 async function crScan() {
@@ -1309,6 +1337,7 @@ function crPick(id) {
   crOpen$.set(id)
   crViewVersion$.set(null)
   crDirty$.set(false)
+  crVersionGone$.set(false)
 }
 
 function CrHeader() {
@@ -1323,6 +1352,7 @@ function CrHeader() {
 
   const step = (to) => {
     crDirty$.set(false)
+    crVersionGone$.set(false)
     crViewVersion$.set(to >= count ? null : Math.max(1, to))
     crPoll().catch(() => {}) // pull the picked version's content now, not in ~2s
   }
@@ -1537,10 +1567,19 @@ function CrPreview() {
   })
 }
 
+function CrVersionGone() {
+  return jsx('div', {
+    className: 'cr-cell',
+    style: { padding: 12, fontSize: 12, opacity: 0.7 },
+    children: 'This version is no longer available.',
+  })
+}
+
 function CreatorPane() {
   const sid = useValue(crSid$)
   const open = useValue(crOpen$)
   const detail = useValue(crDetail$)
+  const gone = useValue(crVersionGone$)
 
   useEffect(() => {
     let live = true
@@ -1593,10 +1632,12 @@ function CreatorPane() {
           children: [
             jsx('style', { children: CR_CSS }),
             jsx(CrErrorBoundary, {
-              children: jsxs('div', {
-                className: 'cr-split',
-                children: [jsx(CrEditor, {}), type === 'code' ? null : jsx(CrPreview, {})],
-              }),
+              children: gone
+                ? jsx(CrVersionGone, {})
+                : jsxs('div', {
+                    className: 'cr-split',
+                    children: [jsx(CrEditor, {}), type === 'code' ? null : jsx(CrPreview, {})],
+                  }),
             }, open),
           ],
         }),
