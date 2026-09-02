@@ -1,5 +1,5 @@
 """Creator store — all Creator behaviour. stdlib only; no relative imports."""
-import base64, hashlib, json, os, re, sqlite3, time
+import base64, difflib, hashlib, json, os, re, sqlite3, time
 from pathlib import Path
 
 
@@ -57,6 +57,11 @@ TYPE_EXT = {
     "svg": "svg",
     "react": "jsx",
 }
+
+VALID_TYPES = ("code", "html", "svg", "markdown", "mermaid")  # Task 23 adds "react"
+TRUNCATION_NOTE = "… (full content in the artifact)"
+OVERSIZE_NOTE = "open the Creator pane for the full artifact"
+_RETRIES = 3
 
 
 def sha256_of(content: str) -> str:
@@ -202,6 +207,7 @@ def _add_version_once(identifier, *, type_, title, language, content,
             os.fsync(f.fileno())
         os.replace(tmp, final)
         _fsync_dir(d)
+        sha = sha256_of(content)
 
         if row:
             sets, params = ["updated_at = ?"], [now]
@@ -222,7 +228,7 @@ def _add_version_once(identifier, *, type_, title, language, content,
         conn.execute(
             "INSERT INTO versions(identifier, n, ext, sha256, bytes, source, "
             "restored_from, created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (identifier, n, ext, sha256_of(content), len(data), source,
+            (identifier, n, ext, sha, len(data), source,
              restored_from, now))
 
         if session_id:
@@ -233,7 +239,7 @@ def _add_version_once(identifier, *, type_, title, language, content,
 
         conn.execute("COMMIT")
         return {"identifier": identifier, "dir": dir_, "version": n,
-                "sha256": sha256_of(content), "action": action}
+                "sha256": sha, "action": action}
     finally:
         conn.close()
 
@@ -242,14 +248,14 @@ def add_version(identifier, *, type_, title, language, content, origin, source,
                 session_id, restored_from=None) -> dict:
     """Transactional version write (§5.3). Retries the whole op on lock
     contention, then raises StoreBusy."""
-    for attempt in range(3):
+    for attempt in range(_RETRIES):
         try:
             return _add_version_once(
                 identifier, type_=type_, title=title, language=language,
                 content=content, origin=origin, source=source,
                 session_id=session_id, restored_from=restored_from)
         except (sqlite3.OperationalError, sqlite3.IntegrityError):
-            if attempt == 2:
+            if attempt == _RETRIES - 1:
                 raise StoreBusy("store busy, retry")
             time.sleep(0.1)
 
@@ -269,6 +275,128 @@ def latest(identifier) -> dict | None:
         return None
     return {"version": row[0], "sha256": row[1], "type": row[2],
             "ext": row[3], "title": row[4], "language": row[5]}
+
+
+class StoreNotFound(Exception):
+    """Raised by a tool op that targets an identifier with no artifact."""
+
+
+class StoreBadInput(Exception):
+    """Raised on missing/invalid tool args (§5.7 error text)."""
+
+
+def _meta(identifier):
+    """(dir, type, title, language, updated_at, version_count, max_n) or None."""
+    conn = _connect()
+    try:
+        return conn.execute(
+            "SELECT a.dir, a.type, a.title, a.language, a.updated_at, "
+            "(SELECT COUNT(*) FROM versions WHERE identifier = a.identifier), "
+            "(SELECT MAX(n) FROM versions WHERE identifier = a.identifier) "
+            "FROM artifacts a WHERE a.identifier = ?", (identifier,)).fetchone()
+    finally:
+        conn.close()
+
+
+def _cap(s: str, limit: int, note: str | None = None) -> str:
+    """Truncate `s` to `limit` bytes on a char boundary; append `note` if cut."""
+    if len(s.encode("utf-8")) <= limit:
+        return s
+    out = s.encode("utf-8")[:limit].decode("utf-8", "ignore")
+    return out + ("\n" + note if note else "")
+
+
+def record_session(identifier, session_id) -> None:
+    """Link a session to an artifact without adding a version (§5.7 unchanged)."""
+    if not session_id:
+        return
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO artifact_sessions(identifier, session_id, first_seen) "
+            "VALUES(?,?,?) ON CONFLICT(identifier, session_id) DO NOTHING",
+            (identifier, session_id, time.time()))
+    finally:
+        conn.close()
+
+
+def do_create(args: dict, session_id: str) -> dict:
+    """`create_artifact` dispatch (§5.7). No content echoed in the result."""
+    ident = (args.get("identifier") or "").strip()
+    type_ = args.get("type") or ""
+    title = args.get("title") or ""
+    content = args.get("content")
+    language = args.get("language") or None
+    if not (ident and type_ and title and content):
+        raise StoreBadInput("create_artifact requires identifier, type, title, content")
+    if type_ not in VALID_TYPES:
+        raise StoreBadInput("type must be one of " + ", ".join(VALID_TYPES))
+
+    exists = latest(ident) is not None
+    source = "update" if exists else "create"
+    r = add_version(ident, type_=type_, title=title, language=language,
+                    content=content, origin="tool", source=source,
+                    session_id=session_id)
+    cur = latest(ident)
+    if not exists:
+        return {"identifier": ident, "version": r["version"], "type": cur["type"],
+                "title": cur["title"], "action": "created", "note": ""}
+    note = f"identifier exists; kept original type '{cur['type']}' (ext .{cur['ext']})"
+    if type_ != cur["type"]:
+        note += f"; ignored requested type '{type_}'"
+    return {"identifier": ident, "version": r["version"], "type": cur["type"],
+            "title": cur["title"], "action": "updated", "note": note}
+
+
+def do_update(args: dict, session_id: str) -> dict:
+    """`update_artifact` dispatch (§5.6/§5.7)."""
+    ident = (args.get("identifier") or "").strip()
+    content = args.get("content")
+    if content is None:
+        raise StoreBadInput("update_artifact requires identifier, content")
+    prev = latest(ident)
+    if prev is None:
+        raise StoreNotFound(f"no artifact '{ident}' — call create_artifact first")
+    if OVERSIZE_NOTE in content:
+        raise StoreBadInput(
+            "content still contains the oversize-artifact note; "
+            "open the Creator pane and copy the full artifact first")
+    if sha256_of(content) == prev["sha256"]:
+        record_session(ident, session_id)
+        return {"action": "unchanged", "version": prev["version"]}
+
+    prev_n, ext = prev["version"], prev["ext"]
+    r = add_version(ident, type_=prev["type"], title=prev["title"],
+                    language=prev["language"], content=content, origin="tool",
+                    source="update", session_id=session_id)
+    prev_text = (_creator_dir() / r["dir"] / f"v{prev_n}.{ext}").read_text(
+        encoding="utf-8")
+    diff = "".join(difflib.unified_diff(
+        prev_text.splitlines(keepends=True), content.splitlines(keepends=True),
+        fromfile=f"v{prev_n}", tofile=f"v{r['version']}"))
+    return {"action": "updated", "version": r["version"],
+            "diff": _cap(diff, 4096),
+            "content": _cap(content, 10240, TRUNCATION_NOTE)}
+
+
+def do_read(args: dict) -> dict:
+    """`read_artifact` dispatch (§5.6). Full content unless > 256 KB."""
+    ident = (args.get("identifier") or "").strip()
+    row = _meta(ident)
+    if row is None:
+        raise StoreNotFound(f"no artifact '{ident}' — call create_artifact first")
+    dir_, type_, title, language, updated_at, vcount, maxn = row
+    text = (_creator_dir() / dir_ / f"v{maxn}.{ext_for(type_, language)}").read_text(
+        encoding="utf-8")
+    out = {"identifier": ident, "version": maxn, "type": type_, "title": title,
+           "version_count": vcount, "updated_at": updated_at}
+    if len(text.encode("utf-8")) > 256 * 1024:
+        out["content"] = text.encode("utf-8")[:256 * 1024].decode("utf-8", "ignore")
+        out["truncated"] = True
+        out["note"] = OVERSIZE_NOTE
+    else:
+        out["content"] = text
+    return out
 
 
 def _selfcheck() -> None:
@@ -341,6 +469,31 @@ def _selfcheck() -> None:
                 for n, sha in rows:
                     disk = (_creator_dir() / "race" / f"v{n}.py").read_text()
                     assert sha256_of(disk) == sha, (n, disk)
+            finally:
+                conn.close()
+
+            # Task 6: do_create / do_update / do_read dispatch
+            c = do_create({"identifier": "doc", "type": "markdown", "title": "Doc", "content": "# hi"}, "s1")
+            assert c["action"] == "created" and c["version"] == 1 and "content" not in c
+            c2 = do_create({"identifier": "doc", "type": "code", "title": "Doc2", "content": "# hi\n\nmore"}, "s1")
+            assert c2["action"] == "updated" and c2["type"] == "markdown"  # original type kept
+            u_same = do_update({"identifier": "doc", "content": "# hi\n\nmore\n"}, "s1")  # only trailing \n differs
+            assert u_same["action"] == "unchanged"
+            u = do_update({"identifier": "doc", "content": "# hi\n\nchanged"}, "s2")
+            assert u["action"] == "updated" and "changed" in u["content"] and "@@" in u["diff"]
+            try:
+                do_update({"identifier": "nope", "content": "x"}, "s1"); assert False
+            except StoreNotFound: pass
+            try:
+                do_update({"identifier": "doc", "content": "x " + OVERSIZE_NOTE}, "s1"); assert False
+            except StoreBadInput: pass
+            r = do_read({"identifier": "doc"})
+            assert r["version"] == 3 and r["content"] == "# hi\n\nchanged" and r["version_count"] == 3
+            # session recorded even on unchanged
+            conn = _connect()
+            try:
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM artifact_sessions WHERE identifier='doc'").fetchone()[0] == 2
             finally:
                 conn.close()
     finally:
