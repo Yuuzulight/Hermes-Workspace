@@ -357,7 +357,16 @@ def _selfcheck_creator_http() -> None:
             w = c.get("/creator/asset/esbuild.wasm").json()
             import base64 as _b
             assert w["encoding"] == "base64" and _b.b64decode(w["data"])[:2] == b"\x00a"
-            assert c.get("/creator/asset/../plugin_api.py").status_code == 400
+            # HTTP-level traversal attempts never reach the route: httpx's
+            # TestClient normalizes `../` out of the URL client-side before
+            # sending, so the guard must be exercised as a direct call instead.
+            from fastapi import HTTPException
+            for bad in ("../plugin_api.py", "..\\plugin_api.py", "....//plugin_api.py"):
+                try:
+                    cr_api.get_asset(bad)
+                    assert False, f"{bad!r} was not rejected"
+                except HTTPException as e:
+                    assert e.status_code == 400, (bad, e.status_code)
             assert c.get("/creator/asset/nope.js").status_code == 404
             # defensive mount: a broken cr_api import must not unmount hw_* routes
             import plugin_api, importlib

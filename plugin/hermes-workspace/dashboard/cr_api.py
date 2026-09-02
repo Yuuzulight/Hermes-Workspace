@@ -134,13 +134,3 @@ def get_asset(name: str):
     data = base64.b64encode(raw).decode("ascii") if encoding == "base64" else raw.decode("utf-8")
     return {"name": name, "encoding": encoding, "data": data,
             "sha256": hashlib.sha256(raw).hexdigest()}
-
-
-@router.get("/{_unmatched:path}")
-def _unmatched_get(_unmatched: str):
-    """HTTP clients collapse `../` out of a URL path before sending it (RFC 3986
-    dot-segment removal), so a traversal attempt like `/creator/asset/../x` never
-    reaches `/asset/{name}` — it arrives here as `/creator/x` instead. Registered
-    last (only matches what no real route did): treat it as the malformed/hostile
-    request it is rather than leaking a generic 404."""
-    raise HTTPException(status_code=400, detail="invalid path")
