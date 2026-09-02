@@ -1170,6 +1170,90 @@ function crEsbuild() {
   return crEsbuildPromise
 }
 
+// MANIFEST.json ({specifier: {file, subdeps}}), fetched once and memoized —
+// crAsset already caches the raw text by name, this just parses it once.
+let crManifestPromise = null
+function crManifest() {
+  if (!crManifestPromise) crManifestPromise = crAsset('MANIFEST.json').then((text) => JSON.parse(text))
+  return crManifestPromise
+}
+
+// specifier -> Promise<string> (vendored lib source text). Module-scoped so it
+// survives across crBundle calls. This IS the "cache by name" from the brief,
+// and it doubles as the diamond-dependency de-dup: if two libs both need
+// 'react' concurrently, both onLoad calls for 'react' await this SAME
+// in-flight crAsset promise (stored before either await resolves) rather than
+// firing two fetches.
+const crLibCache = new Map()
+
+// esbuild vfs plugin: bare specifiers found in MANIFEST resolve into the
+// 'creator-vfs' namespace and load from the vendored bundle text. Anything
+// else (a relative import, an unknown package) is left alone so esbuild's own
+// resolver fails it with a normal "could not resolve" diagnostic.
+function crVfsPlugin(manifest) {
+  return {
+    name: 'creator-vfs',
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (args) => {
+        if (!Object.prototype.hasOwnProperty.call(manifest, args.path)) return null
+        return { path: args.path, namespace: 'creator-vfs' }
+      })
+      build.onLoad({ filter: /.*/, namespace: 'creator-vfs' }, async (args) => {
+        if (!crLibCache.has(args.path)) crLibCache.set(args.path, crAsset(manifest[args.path].file))
+        return { contents: await crLibCache.get(args.path), loader: 'js' }
+      })
+    },
+  }
+}
+
+function crFormatBuildErrors(errors) {
+  return (errors || [])
+    .map((e) => {
+      const loc = e.location
+      return (loc ? `${loc.file}:${loc.line}:${loc.column}: ` : '') + e.text
+    })
+    .join('\n')
+}
+
+const crBundleCache = new Map() // sha256(source) -> {ok:true,code} | {ok:false,errors}
+
+async function crBundleHash(source) {
+  const bytes = new TextEncoder().encode(source)
+  return crHex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+}
+
+// Preview build (spec §6.2 step 3): bundle `source` (a react-artifact module)
+// against the vendored library vfs. Cached by content hash — a repeat call
+// with identical source skips rebuilding entirely.
+async function crBundle(source) {
+  const hash = await crBundleHash(source)
+  if (crBundleCache.has(hash)) return crBundleCache.get(hash)
+
+  const [esbuild, manifest] = await Promise.all([crEsbuild(), crManifest()])
+  let result
+  try {
+    const built = await esbuild.build({
+      stdin: { contents: source, loader: 'tsx', resolveDir: '/', sourcefile: 'artifact.tsx' },
+      bundle: true,
+      format: 'iife',
+      globalName: '__CreatorArtifact',
+      jsx: 'automatic',
+      jsxImportSource: 'react',
+      write: false,
+      plugins: [crVfsPlugin(manifest)],
+    })
+    result = { ok: true, code: built.outputFiles[0].text }
+  } catch (e) {
+    // esbuild-wasm's build() rejects (rather than resolving with .errors) on a
+    // failed build outside a rebuild/watch context — the thrown error carries
+    // the diagnostics array.
+    const errors = e && e.errors
+    result = { ok: false, errors: errors && errors.length ? crFormatBuildErrors(errors) : String((e && e.message) || e) }
+  }
+  crBundleCache.set(hash, result)
+  return result
+}
+
 const crSid$ = atom('') // focusedStoredSessionId at last poll ('' = no chat)
 const crOpen$ = atom(null) // open artifact identifier | null
 const crList$ = atom([]) // [{identifier,type,title,version,updated_at,origin,in_session}]
@@ -1772,6 +1856,30 @@ function crRegister(ctx) {
             write: false,
           })
           host.notify({ kind: 'info', message: `bundle ${r.outputFiles[0].text.length} bytes` })
+        },
+      },
+    },
+    {
+      // Temporary manual-test command for crBundle (spec §6.2 step 3, kept
+      // dev-gated per this file's Task 17 convention rather than removed).
+      id: 'cr-palette-bundle-smoke',
+      area: PALETTE_AREA,
+      data: {
+        id: 'hermes-workspace.creator-bundle-smoke',
+        label: 'Creator: bundle smoke test',
+        run: async () => {
+          const ok = await crBundle(
+            "import { LineChart } from 'recharts'\nexport default () => <LineChart/>",
+          )
+          host.notify({
+            kind: ok.ok ? 'info' : 'warning',
+            message: ok.ok ? `recharts fixture: ok, ${ok.code.length} bytes` : `recharts fixture failed:\n${ok.errors}`,
+          })
+          const bad = await crBundle('export default () => <div>(')
+          host.notify({
+            kind: bad.ok ? 'warning' : 'info',
+            message: bad.ok ? 'syntax-error fixture unexpectedly built ok' : `syntax-error fixture diagnostics:\n${bad.errors}`,
+          })
         },
       },
     },
