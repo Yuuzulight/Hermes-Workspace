@@ -54,6 +54,10 @@ class ExportBundleBody(BaseModel):
     dest: str | None = None
 
 
+class PublishBody(BaseModel):
+    html: str | None = None
+
+
 def _guard(fn):
     """Map cr_store store exceptions onto their HTTP status for one route."""
     @functools.wraps(fn)
@@ -137,6 +141,16 @@ def export_artifact(id: str, body: ExportBody = ExportBody()):
 @_guard
 def export_bundle(id: str, body: ExportBundleBody):
     return {"path": cr_store.write_export_bundle(id, body.html, body.dest)}
+
+
+@router.post("/artifacts/{id}/publish")
+@_guard
+def publish_artifact(id: str, body: PublishBody = PublishBody()):
+    # publish_artifact returns {"error": ...} for expected/recoverable cases
+    # (needs_pane, github_not_configured, gist_create_failed) rather than
+    # raising — same 200-with-error-body shape the rest of this route relays
+    # verbatim; only StoreNotFound (unknown id) reaches _guard as a 404.
+    return cr_store.publish_artifact(id, body.html)
 
 
 @router.get("/asset/{name}")

@@ -447,6 +447,81 @@ def _selfcheck_creator_export() -> None:
     print("  creator export ok")
 
 
+def _selfcheck_creator_publish() -> None:
+    """Task 31: POST /creator/artifacts/{id}/publish — routes through to
+    cr_store.publish_artifact and relays its result verbatim (200, even for
+    an {"error": ...} body — publish_artifact returns those for expected/
+    recoverable conditions rather than raising). Monkeypatches shutil.which +
+    subprocess.run (module-global, so cr_api's explicit-path-loaded cr_store
+    sees them too) so this NEVER shells out to the real `gh` CLI."""
+    import shutil
+    import subprocess
+    import tempfile
+    saved = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            import cr_api
+            from fastapi import FastAPI
+            from fastapi.testclient import TestClient
+            app = FastAPI(); app.include_router(cr_api.router)
+            c = TestClient(app)
+
+            cr_api.cr_store.do_create(
+                {"identifier": "pub-http-doc", "type": "markdown", "title": "Pub Http Doc",
+                 "content": "# hi"}, "sess-publish")
+            cr_api.cr_store.do_create(
+                {"identifier": "pub-http-app", "type": "react", "title": "PubApp",
+                 "content": "export default () => null"}, "sess-publish")
+
+            orig_which, orig_run = shutil.which, subprocess.run
+
+            def fake_run(args, **kw):
+                if args[:2] == ["gh", "auth"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args[:3] == ["gh", "gist", "create"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, "https://gist.github.com/testuser/deadbeef01\n", "")
+                raise AssertionError(f"unexpected subprocess.run in selftest: {args}")
+
+            shutil.which = lambda name: "/usr/bin/gh" if name == "gh" else None
+            subprocess.run = fake_run
+            try:
+                r = c.post("/creator/artifacts/pub-http-doc/publish")
+                assert r.status_code == 200, (r.status_code, r.text)
+                assert r.json() == {
+                    "url": "https://gist.github.com/testuser/deadbeef01",
+                    "raw_url": "https://raw.githack.com/testuser/deadbeef01/raw/pub-http-doc.html"}
+
+                rn = c.post("/creator/artifacts/pub-http-app/publish")
+                assert rn.status_code == 200 and rn.json() == {"error": "needs_pane"}
+
+                rh = c.post("/creator/artifacts/pub-http-app/publish",
+                           json={"html": "<html><body>x</body></html>"})
+                assert rh.status_code == 200 and rh.json()["url"].startswith(
+                    "https://gist.github.com/")
+            finally:
+                shutil.which, subprocess.run = orig_which, orig_run
+
+            shutil.which = lambda name: None
+            try:
+                rc = c.post("/creator/artifacts/pub-http-doc/publish")
+                assert rc.status_code == 200
+                assert rc.json() == {
+                    "error": "github_not_configured",
+                    "how": "install gh and run gh auth login, or set a token in Creator settings"}
+            finally:
+                shutil.which = orig_which
+
+            # unknown identifier -> 404 via _guard, like every other route
+            rm = c.post("/creator/artifacts/nope-pub/publish")
+            assert rm.status_code == 404, rm.status_code
+    finally:
+        if saved is None: os.environ.pop("HERMES_HOME", None)
+        else: os.environ["HERMES_HOME"] = saved
+    print("  creator publish ok")
+
+
 def _selfcheck_creator_defensive_mount() -> None:
     """A throw from `import cr_api` must leave every hw_* route mounted and log a warning."""
     import builtins
@@ -500,5 +575,6 @@ if __name__ == "__main__":
     _selfcheck_read_assistant_messages()
     _selfcheck_creator_http()
     _selfcheck_creator_export()
+    _selfcheck_creator_publish()
     _selfcheck_creator_defensive_mount()
     print("ok")

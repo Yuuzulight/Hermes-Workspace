@@ -1,5 +1,5 @@
 """Creator store — all Creator behaviour. stdlib only; no relative imports."""
-import base64, difflib, hashlib, html, json, os, re, shutil, sqlite3, time
+import base64, difflib, hashlib, html, json, os, re, shutil, sqlite3, subprocess, tempfile, time
 from pathlib import Path
 
 
@@ -726,6 +726,63 @@ def write_export_bundle(identifier: str, html: str, dest: str | None = None) -> 
     return str(path)
 
 
+# ── Publish to Gist (§7.3, pane button only — no agent tool) ─────────────────
+
+_GIST_URL_RE = re.compile(r"^https://gist\.github\.com/([^/\s]+)/([0-9a-f]+)/?$")
+
+
+def publish_artifact(identifier: str, html: str | None = None) -> dict:
+    """Publish the artifact's standalone HTML (reusing export_artifact's
+    per-type assembly — `react` supplies its pane-built `html` directly, same
+    contract as write_export_bundle) to a public GitHub gist via the `gh` CLI.
+    Never raises for an expected/recoverable condition — returns {"error": ...}
+    instead; only StoreNotFound (unknown identifier) propagates."""
+    row = _meta(identifier)
+    if row is None:
+        raise StoreNotFound(f"no artifact '{identifier}' — call create_artifact first")
+    dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
+
+    if type_ == "react":
+        if not html:
+            return {"error": "needs_pane"}
+        doc = html
+    else:
+        doc = Path(export_artifact(identifier)).read_text(encoding="utf-8")
+
+    if not shutil.which("gh"):
+        return {"error": "github_not_configured",
+                "how": "install gh and run gh auth login, or set a token in Creator settings"}
+    auth = subprocess.run(["gh", "auth", "status"], capture_output=True)
+    if auth.returncode != 0:
+        return {"error": "github_not_configured",
+                "how": "install gh and run gh auth login, or set a token in Creator settings"}
+
+    # TODO(later): creator.github_token REST-API publish path (gh CLI unavailable case)
+    filename = f"{sanitize_identifier(title or identifier)}.html"
+    tmp_dir = tempfile.mkdtemp(prefix="cr-publish-")
+    try:
+        file_path = Path(tmp_dir) / filename
+        file_path.write_text(doc, encoding="utf-8")
+        r = subprocess.run(
+            ["gh", "gist", "create", "--public", str(file_path), "--desc", title or identifier],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            return {"error": "gist_create_failed", "detail": (r.stderr or r.stdout).strip()}
+        lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+        url = lines[-1] if lines else ""
+        m = _GIST_URL_RE.match(url)
+        if not m:
+            return {"error": "gist_create_failed",
+                    "detail": f"could not parse gist URL from gh output: {url!r}"}
+        user, gist_id = m.group(1), m.group(2)
+        # githack.com serves gist raw content with the right content-type so an
+        # .html gist actually renders instead of downloading — see raw.githack.com.
+        raw_url = f"https://raw.githack.com/{user}/{gist_id}/raw/{filename}"
+        return {"url": url, "raw_url": raw_url}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ── Transcript scan (§5.9) ────────────────────────────────────────────────────
 
 NON_ARTIFACT_LANGS = frozenset({
@@ -1120,6 +1177,52 @@ def _selfcheck() -> None:
             assert do_read({"identifier": "app"})["content"] == "export default () => null"
             dir_ = _meta("app")[0]
             assert (_creator_dir() / dir_ / "v1.jsx").is_file()
+    finally:
+        if saved is None: os.environ.pop("HERMES_HOME", None)
+        else: os.environ["HERMES_HOME"] = saved
+
+    # Task 31: publish_artifact — Publish to Gist. Monkeypatches shutil.which +
+    # subprocess.run so this NEVER shells out to the real `gh` CLI (which is
+    # installed and authenticated in some environments and would publish a
+    # real public gist).
+    saved = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            do_create({"identifier": "pub-doc", "type": "markdown", "title": "Pub Doc",
+                      "content": "# hello"}, "s1")
+            do_create({"identifier": "pub-app", "type": "react", "title": "Pub App",
+                      "content": "export default () => null"}, "s1")
+
+            orig_which, orig_run = shutil.which, subprocess.run
+
+            def fake_run(args, **kw):
+                if args[:2] == ["gh", "auth"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args[:3] == ["gh", "gist", "create"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, "https://gist.github.com/testuser/abc123ef0102\n", "")
+                raise AssertionError(f"unexpected subprocess.run in selfcheck: {args}")
+
+            shutil.which = lambda name: "/usr/bin/gh" if name == "gh" else None
+            subprocess.run = fake_run
+            try:
+                r = publish_artifact("pub-doc")
+                assert r == {"url": "https://gist.github.com/testuser/abc123ef0102",
+                            "raw_url": "https://raw.githack.com/testuser/abc123ef0102/raw/pub-doc.html"}, r
+                assert publish_artifact("pub-app") == {"error": "needs_pane"}
+                r2 = publish_artifact("pub-app", html="<html><body>x</body></html>")
+                assert r2["url"] == "https://gist.github.com/testuser/abc123ef0102"
+            finally:
+                shutil.which, subprocess.run = orig_which, orig_run
+
+            shutil.which = lambda name: None
+            try:
+                assert publish_artifact("pub-doc") == {
+                    "error": "github_not_configured",
+                    "how": "install gh and run gh auth login, or set a token in Creator settings"}
+            finally:
+                shutil.which = orig_which
     finally:
         if saved is None: os.environ.pop("HERMES_HOME", None)
         else: os.environ["HERMES_HOME"] = saved
