@@ -1910,6 +1910,139 @@ function CrEditor() {
   })
 }
 
+// CodeMirror 6 loader (task-27, creator-libs/codemirror.js from task-26).
+// codemirror.js is a real ESM (unlike esbuild.js's UMD build) so blob-
+// importing it yields its actual exports directly, same trick as
+// crTailwindLib. Only a SUCCESSFUL load is memoized — a transient crAsset
+// failure (network blip) clears the memo and resolves `null` for that one
+// call instead of wedging every future call behind a cached rejection/null
+// (the Phase 2 review finding this task was told to avoid repeating).
+let crCodeMirrorPromise = null
+function crCodeMirror() {
+  if (crCodeMirrorPromise) return crCodeMirrorPromise
+  crCodeMirrorPromise = (async () => {
+    const src = await crAsset('codemirror.js')
+    const blobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))
+    try {
+      return await import(blobUrl)
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+  })().catch((e) => {
+    console.warn('crCodeMirror: codemirror.js failed to load, falling back to plain textarea', e)
+    crCodeMirrorPromise = null
+    return null
+  })
+  return crCodeMirrorPromise
+}
+
+// Rich editor wrapper (task-27). `basicExtensions`/`readOnly` are all
+// codemirror-entry.js exports (task-26 report) — no `Compartment` and no bare
+// `keymap` facet are part of that surface, so live reconfiguration below
+// leans on two things that ARE static members of the exported `EditorView`
+// class: `EditorView.updateListener` for the dirty/onChange wire and
+// `EditorView.domEventHandlers` for the Mod-s save shortcut (CM6's normal
+// alternative to a one-off `keymap.of(...)` entry). Toggling `readOnly` after
+// mount goes through `view.setState(EditorState.create(...))` — a fresh state
+// dropped onto the SAME EditorView/DOM instance, not a Compartment-scoped
+// facet swap (which we have no Compartment to build), but it still avoids the
+// full `destroy()` + reconstruct the brief warns against.
+function crCmExtensions(cm, { language, dark, readOnly, onChange, onSave }) {
+  return [
+    cm.basicExtensions(language, dark),
+    cm.readOnly(!!readOnly),
+    cm.EditorView.updateListener.of((u) => {
+      if (u.docChanged) onChange?.(u.state.doc.toString())
+    }),
+    cm.EditorView.domEventHandlers({
+      keydown(e) {
+        if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+          e.preventDefault()
+          onSave?.()
+          return true
+        }
+        return false
+      },
+    }),
+  ]
+}
+
+function CrCmEditor({ value, language, readOnly, onChange, onSave }) {
+  const hostRef = useRef(null)
+  const viewRef = useRef(null)
+  const propsRef = useRef({ value, language, readOnly, onChange, onSave })
+  propsRef.current = { value, language, readOnly, onChange, onSave }
+  const [cmOk, setCmOk] = useState(null) // null = loading, false = unavailable, true = mounted
+
+  useEffect(() => {
+    let cancelled = false
+    crCodeMirror().then((cm) => {
+      if (cancelled || !hostRef.current) return
+      if (!cm) {
+        setCmOk(false)
+        return
+      }
+      const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches
+      viewRef.current = new cm.EditorView({
+        doc: propsRef.current.value || '',
+        extensions: crCmExtensions(cm, { ...propsRef.current, dark }),
+        parent: hostRef.current,
+      })
+      setCmOk(true)
+    })
+    return () => {
+      cancelled = true
+      viewRef.current?.destroy()
+      viewRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    const view = viewRef.current
+    if (!view || value === view.state.doc.toString()) return
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: value || '' } })
+  }, [value])
+
+  useEffect(() => {
+    const view = viewRef.current
+    if (!view) return
+    crCodeMirror().then((cm) => {
+      if (!cm || viewRef.current !== view) return
+      const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches
+      view.setState(
+        cm.EditorState.create({
+          doc: view.state.doc,
+          extensions: crCmExtensions(cm, { ...propsRef.current, dark, readOnly }),
+        }),
+      )
+    })
+  }, [readOnly])
+
+  if (cmOk === false) {
+    return jsxs('div', {
+      style: { display: 'flex', flexDirection: 'column', height: '100%' },
+      children: [
+        jsx('div', { style: { fontSize: 11, opacity: 0.6, padding: '2px 4px' }, children: 'Rich editor unavailable — plain text editor' }),
+        jsx(Textarea, {
+          className: 'block w-full resize-none rounded-none border-0 bg-transparent p-2.5 font-mono text-xs leading-relaxed shadow-none focus-visible:ring-0',
+          style: { flex: 1, minHeight: 140 },
+          value,
+          readOnly: !!readOnly,
+          spellCheck: false,
+          onChange: (e) => onChange?.(e.target.value),
+          onKeyDown: (e) => {
+            if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+              e.preventDefault()
+              onSave?.()
+            }
+          },
+        }),
+      ],
+    })
+  }
+  return jsx('div', { ref: hostRef, className: 'cr-cm-editor', style: { height: '100%' } })
+}
+
 // React artifact preview iframe (spec §6.3). `bundle`/`css`/`nonce`/
 // `injectRuntime` are handed straight to crReactSrcdoc (async, hence the
 // build-in-an-effect state below). Re-keyed on the bundle's content hash so a
