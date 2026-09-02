@@ -11,6 +11,9 @@ def sanitize_identifier(raw: str) -> str:
     """Sanitize a raw identifier per spec §5.1: lowercase, [a-z0-9._-], collapse -,
     strip leading/trailing -., reject .., no backslash, first char alnum, cap 64,
     empty → "artifact"."""
+    # §5.1: any ".." in the raw input is rejected outright
+    if ".." in raw:
+        return "artifact"
     # Lowercase and replace non-allowed chars with dash
     s = re.sub(r"[^a-z0-9._-]+", "-", raw.lower())
     # Collapse multiple dashes
@@ -135,6 +138,139 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+class StoreBusy(Exception):
+    """Raised when a write op can't get the DB lock after retries (§3.4)."""
+
+
+def _fsync_dir(path) -> None:
+    """fsync a directory so a rename is durable. No-op on Windows (unsupported)."""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _alloc_dir(conn: sqlite3.Connection, base: str) -> str:
+    """Lowest free `<base>` / `<base>-<k>` slot (§5.3)."""
+    taken = {r[0] for r in conn.execute(
+        "SELECT dir FROM artifacts WHERE dir = ?1 OR dir GLOB ?1 || '-[0-9]*'",
+        (base,))}
+    if base not in taken:
+        return base
+    k = 2
+    while f"{base}-{k}" in taken:
+        k += 1
+    return f"{base}-{k}"
+
+
+def _add_version_once(identifier, *, type_, title, language, content,
+                      origin, source, session_id, restored_from):
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        row = conn.execute(
+            "SELECT dir, type, language FROM artifacts WHERE identifier = ?",
+            (identifier,)).fetchone()
+        if row:
+            dir_, otype, olang = row
+            ext = ext_for(otype, olang)
+            n = conn.execute(
+                "SELECT COALESCE(MAX(n), 0) FROM versions WHERE identifier = ?",
+                (identifier,)).fetchone()[0] + 1
+            action = "appended"
+        else:
+            dir_ = _alloc_dir(conn, sanitize_identifier(identifier))
+            ext = ext_for(type_, language)
+            n = 1
+            action = "created"
+
+        # File write happens INSIDE the txn, BEFORE the row inserts: a pre-COMMIT
+        # raise rolls back the rows and the orphan .<ext> file is ignored by all
+        # readers (they go through the index).
+        d = _creator_dir() / dir_
+        d.mkdir(parents=True, exist_ok=True)
+        data = content.encode("utf-8")
+        final = d / f"v{n}.{ext}"
+        tmp = d / f"v{n}.{ext}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, final)
+        _fsync_dir(d)
+
+        if row:
+            sets, params = ["updated_at = ?"], [now]
+            if title:
+                sets.append("title = ?"); params.append(title)
+            if language:
+                sets.append("language = ?"); params.append(language)
+            params.append(identifier)
+            conn.execute(
+                f"UPDATE artifacts SET {', '.join(sets)} WHERE identifier = ?",
+                params)
+        else:
+            conn.execute(
+                "INSERT INTO artifacts(identifier, dir, type, language, title, "
+                "origin, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (identifier, dir_, type_, language, title or "", origin, now, now))
+
+        conn.execute(
+            "INSERT INTO versions(identifier, n, ext, sha256, bytes, source, "
+            "restored_from, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (identifier, n, ext, sha256_of(content), len(data), source,
+             restored_from, now))
+
+        if session_id:
+            conn.execute(
+                "INSERT INTO artifact_sessions(identifier, session_id, first_seen)"
+                " VALUES(?,?,?) ON CONFLICT(identifier, session_id) DO NOTHING",
+                (identifier, session_id, now))
+
+        conn.execute("COMMIT")
+        return {"identifier": identifier, "dir": dir_, "version": n,
+                "sha256": sha256_of(content), "action": action}
+    finally:
+        conn.close()
+
+
+def add_version(identifier, *, type_, title, language, content, origin, source,
+                session_id, restored_from=None) -> dict:
+    """Transactional version write (§5.3). Retries the whole op on lock
+    contention, then raises StoreBusy."""
+    for attempt in range(3):
+        try:
+            return _add_version_once(
+                identifier, type_=type_, title=title, language=language,
+                content=content, origin=origin, source=source,
+                session_id=session_id, restored_from=restored_from)
+        except (sqlite3.OperationalError, sqlite3.IntegrityError):
+            if attempt == 2:
+                raise StoreBusy("store busy, retry")
+            time.sleep(0.1)
+
+
+def latest(identifier) -> dict | None:
+    """Newest version of an artifact, or None."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT v.n, v.sha256, a.type, v.ext, a.title, a.language "
+            "FROM versions v JOIN artifacts a ON a.identifier = v.identifier "
+            "WHERE v.identifier = ? ORDER BY v.n DESC LIMIT 1",
+            (identifier,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {"version": row[0], "sha256": row[1], "type": row[2],
+            "ext": row[3], "title": row[4], "language": row[5]}
+
+
 def _selfcheck() -> None:
     # skeleton assertions grow every task
     assert normalize("a\r\nb\n") == "a\nb"
@@ -159,6 +295,54 @@ def _selfcheck() -> None:
                 assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
             finally:
                 conn.close()
+
+            # Task 5: add_version — transactional write path
+            r1 = add_version("w", type_="code", title="W", language="python",
+                             content="print(1)", origin="tool", source="create", session_id="s1")
+            assert r1["version"] == 1 and r1["action"] == "created"
+            r2 = add_version("w", type_="code", title="W2", language="python",
+                             content="print(2)", origin="tool", source="update", session_id="s1")
+            assert r2["version"] == 2
+            conn = _connect()
+            try:
+                assert conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 1
+                assert conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0] == 2
+                assert (_creator_dir() / r1["dir"] / "v2.py").read_text() == "print(2)"
+                assert conn.execute("SELECT title FROM artifacts").fetchone()[0] == "W2"
+            finally:
+                conn.close()
+            assert latest("w") == {"version": 2, "sha256": sha256_of("print(2)"),
+                                   "type": "code", "ext": "py", "title": "W2", "language": "python"}
+            assert latest("nope") is None
+
+            # different identifiers colliding on <dir>
+            a = add_version("Report!", type_="markdown", title="A", language=None,
+                            content="# a", origin="tool", source="create", session_id="s1")
+            b = add_version("report", type_="markdown", title="B", language=None,
+                            content="# b", origin="tool", source="create", session_id="s1")
+            assert a["dir"] != b["dir"]
+
+            # concurrency: two threads, same identifier
+            import threading
+            errs = []
+            def _w(i):
+                try:
+                    add_version("race", type_="code", title="R", language="python",
+                                content=f"x={i}", origin="tool", source="update", session_id="s1")
+                except Exception as e:  # noqa
+                    errs.append(e)
+            ts = [threading.Thread(target=_w, args=(i,)) for i in range(2)]
+            [t.start() for t in ts]; [t.join() for t in ts]
+            assert not errs, errs
+            conn = _connect()
+            try:
+                rows = conn.execute("SELECT n, sha256 FROM versions WHERE identifier='race' ORDER BY n").fetchall()
+                assert len(rows) == 2
+                for n, sha in rows:
+                    disk = (_creator_dir() / "race" / f"v{n}.py").read_text()
+                    assert sha256_of(disk) == sha, (n, disk)
+            finally:
+                conn.close()
     finally:
         if saved is None: os.environ.pop("HERMES_HOME", None)
         else: os.environ["HERMES_HOME"] = saved
@@ -167,7 +351,7 @@ def _selfcheck() -> None:
     assert sanitize_identifier("My Cool Widget!!") == "my-cool-widget"
     assert sanitize_identifier("") == "artifact"
     assert sanitize_identifier("...") == "artifact"
-    assert sanitize_identifier("../etc/passwd") == "artifact" or ".." not in sanitize_identifier("../etc/passwd")
+    assert sanitize_identifier("../etc/passwd") == "artifact"
     assert sanitize_identifier("a" * 200) == "a" * 64
     assert sanitize_identifier("---a---b---") == "a-b"
     assert not sanitize_identifier("9lives")[0].isdigit()
