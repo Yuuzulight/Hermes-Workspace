@@ -350,6 +350,15 @@ def _selfcheck_creator_http() -> None:
             assert c.get("/creator/artifacts/my-doc").status_code == 404
             # config
             assert c.post("/creator/config", json={"github_token": "t"}).json()["github_token_set"]
+            # asset envelope route (Task 16)
+            import json
+            env = c.get("/creator/asset/MANIFEST.json").json()
+            assert env["encoding"] == "utf8" and json.loads(env["data"]) is not None
+            w = c.get("/creator/asset/esbuild.wasm").json()
+            import base64 as _b
+            assert w["encoding"] == "base64" and _b.b64decode(w["data"])[:2] == b"\x00a"
+            assert c.get("/creator/asset/../plugin_api.py").status_code == 400
+            assert c.get("/creator/asset/nope.js").status_code == 404
             # defensive mount: a broken cr_api import must not unmount hw_* routes
             import plugin_api, importlib
             assert any(r.path == "/status" for r in plugin_api.router.routes)

@@ -1,6 +1,10 @@
 """Creator HTTP surface (spec §5.10). stdlib + FastAPI + pydantic only at module scope."""
+import base64
 import functools
+import hashlib
 import importlib.util
+import os
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -14,6 +18,10 @@ cr_store = importlib.util.module_from_spec(_s)
 _s.loader.exec_module(cr_store)  # safe: _selfcheck() is under __main__
 
 router = APIRouter(prefix="/creator")
+
+_ASSET_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_ASSET_SUFFIXES = {".js", ".json", ".wasm"}
+_ASSETS_DIR = Path(__file__).resolve().parent / "creator-libs"
 
 _STATUS = {
     cr_store.StoreNotFound: 404,
@@ -108,3 +116,31 @@ def read_config():
 @_guard
 def write_config(body: ConfigBody):
     return cr_store.set_config(body.model_dump(exclude_unset=True))
+
+
+@router.get("/asset/{name}")
+def get_asset(name: str):
+    suffix = Path(name).suffix
+    if not _ASSET_NAME_RE.match(name) or suffix not in _ASSET_SUFFIXES:
+        raise HTTPException(status_code=400, detail="invalid asset name")
+    p = _ASSETS_DIR / name
+    base = os.path.realpath(_ASSETS_DIR)
+    if not os.path.realpath(p).startswith(base + os.sep):
+        raise HTTPException(status_code=400, detail="invalid asset name")
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="asset not found")
+    raw = p.read_bytes()
+    encoding = "base64" if suffix == ".wasm" else "utf8"
+    data = base64.b64encode(raw).decode("ascii") if encoding == "base64" else raw.decode("utf-8")
+    return {"name": name, "encoding": encoding, "data": data,
+            "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+@router.get("/{_unmatched:path}")
+def _unmatched_get(_unmatched: str):
+    """HTTP clients collapse `../` out of a URL path before sending it (RFC 3986
+    dot-segment removal), so a traversal attempt like `/creator/asset/../x` never
+    reaches `/asset/{name}` — it arrives here as `/creator/x` instead. Registered
+    last (only matches what no real route did): treat it as the malformed/hostile
+    request it is rather than leaking a generic 404."""
+    raise HTTPException(status_code=400, detail="invalid path")
