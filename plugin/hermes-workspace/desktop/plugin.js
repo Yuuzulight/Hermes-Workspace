@@ -11,17 +11,20 @@ import {
   atom,
   Button,
   COMPOSER_AREAS,
+  ConfirmDialog,
+  CopyButton,
   EmptyState,
   host,
   PALETTE_AREA,
   SegmentedControl,
   StatusDot,
   Streamdown,
+  Textarea,
   PANES_AREA,
   STATUSBAR_AREAS,
   useValue,
 } from '@hermes/plugin-sdk'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Component, useCallback, useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'hermes-workspace'
@@ -1103,6 +1106,610 @@ function ApprovalPane() {
   })
 }
 
+// ===== CREATOR =====
+// The renderer half of the Creator module. Shares nothing with Knowledge: its
+// own `crCtx` binding, its own `cr`-prefixed atoms, all state module-scoped.
+// Spec §5.11 (pane content + per-type preview) and §3.6 (inner error boundary,
+// iframe theme prelude). Backend lives under
+// /api/plugins/hermes-workspace/creator/ (spec §5.10).
+
+let crCtx = null
+const crApi = (p, o) => crCtx.rest(p, o)
+const crQs = (obj) =>
+  Object.entries(obj)
+    .filter(([, v]) => v != null && v !== '')
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join('&')
+
+const crSid$ = atom('') // focusedStoredSessionId at last poll ('' = no chat)
+const crOpen$ = atom(null) // open artifact identifier | null
+const crList$ = atom([]) // [{identifier,type,title,version,updated_at,origin,in_session}]
+const crDetail$ = atom(null) // GET /artifacts/{id} body
+const crContent$ = atom('') // content of the viewed version
+const crViewVersion$ = atom(null) // viewed version n | null = latest
+const crDirty$ = atom(false) // editor has unsaved edits
+const crBusy$ = atom(false) // a write is in flight
+const crPinned$ = atom(false) // user picked from the <select> — stop auto-following
+const crVersionGone$ = atom(false) // last /v/{n} fetch 404/410'd — show a message, not stale content
+
+// Dedup /v/{n} refetches across poll ticks: skip the fetch when neither the
+// artifact's updated_at nor the viewed version number changed since last time.
+let crLastFetch = { id: null, updatedAt: null, n: null }
+
+const crPath = (id, rest) => `/creator/artifacts/${encodeURIComponent(id)}${rest || ''}`
+
+// This-session artifacts first, then the rest, newest updated_at first.
+function crSort(list) {
+  return [...list].sort(
+    (a, b) =>
+      (b.in_session ? 1 : 0) - (a.in_session ? 1 : 0) ||
+      String(b.updated_at || '').localeCompare(String(a.updated_at || '')),
+  )
+}
+
+// One poll tick — CreatorPane runs it now and every 2s while mounted. Null
+// session → EmptyState, no fetch. Any call that throws bubbles to the caller,
+// which keeps last state and retries next tick (spec §5.10).
+async function crPoll() {
+  const sid = host.state.focusedStoredSessionId?.get?.() || ''
+  crSid$.set(sid)
+  if (!sid) {
+    crList$.set([])
+    crOpen$.set(null)
+    crDetail$.set(null)
+    crContent$.set('')
+    return
+  }
+
+  const r = await crApi(`/creator/artifacts?${crQs({ session_id: sid })}`)
+  const list = crSort((r && r.artifacts) || [])
+  crList$.set(list)
+
+  let open = crOpen$.get()
+  const stillThere = open && list.some((a) => a.identifier === open)
+  // Never auto-switch/reset out from under an unsaved draft (spec §5.10):
+  // a dirty editor keeps showing what it has, even if the pane isn't pinned
+  // or the open artifact dropped out of the list.
+  if ((!stillThere || !crPinned$.get()) && !crDirty$.get()) {
+    const next = list.length ? list[0].identifier : null
+    if (next !== open) {
+      open = next
+      crOpen$.set(open)
+      crViewVersion$.set(null)
+      crDirty$.set(false)
+    }
+  }
+  if (!open) {
+    crDetail$.set(null)
+    crContent$.set('')
+    return
+  }
+
+  let detail
+  try {
+    detail = await crApi(crPath(open))
+  } catch (e) {
+    // 404 → deleted elsewhere; drop back to the picker (spec §5.10).
+    if (/\b404\b/.test(String((e && e.message) || e))) {
+      crOpen$.set(null)
+      crPinned$.set(false)
+      crDetail$.set(null)
+      crContent$.set('')
+      return
+    }
+    throw e
+  }
+  crDetail$.set(detail)
+
+  if (crDirty$.get()) return // don't clobber active edits
+  const count = detail.version_count || 1
+  const n = crViewVersion$.get() == null ? count : crViewVersion$.get()
+
+  // Nothing changed since the last successful (or 404/410'd) fetch of this
+  // exact artifact+version — skip re-downloading up to 1MB of content.
+  const unchanged =
+    crLastFetch.id === open && crLastFetch.updatedAt === detail.updated_at && crLastFetch.n === n
+  if (unchanged) return
+
+  try {
+    const v = await crApi(crPath(open, `/v/${n}`))
+    crVersionGone$.set(false)
+    crContent$.set((v && v.content) || '')
+  } catch (e) {
+    // 404/410 (StoreGone) → the version row/file is gone; stop showing stale
+    // content and stop silently retrying every tick (spec §5.10/§3.4).
+    if (/\b(404|410)\b/.test(String((e && e.message) || e))) {
+      crVersionGone$.set(true)
+      crContent$.set('')
+    } else {
+      throw e
+    }
+  }
+  crLastFetch = { id: open, updatedAt: detail.updated_at, n }
+}
+
+async function crScan() {
+  const sid = host.state.focusedStoredSessionId?.get?.() || ''
+  return crApi('/creator/scan', { method: 'POST', body: { session_id: sid } })
+}
+
+// Copied (not imported) from inline-preview-directive.tsx per §3.6: resolve the
+// five theme-bridge tokens + the app font against the live document, for the
+// html preview iframe's opaque origin.
+function crThemePrelude() {
+  const map = {
+    '--foreground': '--ui-text-primary',
+    '--muted-foreground': '--ui-text-tertiary',
+    '--accent': '--ui-accent',
+    '--border': '--ui-stroke-tertiary',
+    '--card': '--ui-bg-editor',
+  }
+  let tokens = ''
+  try {
+    const root = getComputedStyle(document.documentElement)
+    for (const [alias, src] of Object.entries(map)) {
+      const val = root.getPropertyValue(src).trim()
+      if (val) tokens += `${alias}:${val};`
+    }
+  } catch {}
+  let font = ''
+  try {
+    font = getComputedStyle(document.body).fontFamily
+  } catch {}
+  return (
+    `<style>:root{${tokens}}` +
+    `html,body{margin:0;padding:0;background:transparent;color:var(--foreground,inherit);` +
+    (font ? `font-family:${font};` : '') +
+    `}</style>`
+  )
+}
+
+function crHtmlDoc(html) {
+  const src = html || ''
+  const prelude = crThemePrelude()
+  if (/<html[\s>]/i.test(src)) {
+    // Full document — the doctype must stay the first token or the browser
+    // renders in quirks mode, so splice the prelude in rather than prepend it.
+    // Prefer just inside <head…>; else right after <!doctype …>; else (no
+    // doctype, no head — rare) fall back to a raw prepend.
+    const headOpen = /<head[^>]*>/i.exec(src)
+    if (headOpen) {
+      const at = headOpen.index + headOpen[0].length
+      return src.slice(0, at) + prelude + src.slice(at)
+    }
+    const doctype = /^\s*<!doctype\s[^>]*>/i.exec(src)
+    if (doctype) {
+      const at = doctype.index + doctype[0].length
+      return src.slice(0, at) + prelude + src.slice(at)
+    }
+    return prelude + src
+  }
+  // Fragment → minimal doc + reset.
+  return (
+    '<!doctype html><meta charset="utf-8">' +
+    prelude +
+    '<style>*,*::before,*::after{box-sizing:border-box}body{margin:12px;color:var(--foreground,inherit)}</style>' +
+    src
+  )
+}
+
+function crB64(s) {
+  const bytes = new TextEncoder().encode(String(s || ''))
+  let bin = ''
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
+  return btoa(bin)
+}
+
+const CR_CSS = `
+.cr-body{container-type:inline-size;flex:1;min-height:0;display:flex}
+.cr-split{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;gap:1px}
+.cr-split>.cr-cell{flex:1;min-width:0;min-height:0;overflow:auto;background:var(--ui-bg-editor,transparent)}
+@container (min-width:640px){.cr-split{flex-direction:row}}
+.cr-frame{width:100%;height:100%;min-height:180px;border:0;background:#fff}
+`
+
+// Creator's own React class boundary (§3.6). Reused as the per-artifact inner
+// boundary via a `key`, so one bad artifact can't blank the whole pane.
+class CrErrorBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { err: null }
+  }
+  static getDerivedStateFromError(err) {
+    return { err }
+  }
+  componentDidCatch(err) {
+    try {
+      host.notifyError?.(err, 'Creator pane error')
+    } catch {}
+  }
+  render() {
+    if (!this.state.err) return this.props.children
+    return jsx('div', {
+      style: { padding: 12, fontSize: 12, opacity: 0.7 },
+      children: `Creator hit an error: ${(this.state.err && this.state.err.message) || this.state.err}`,
+    })
+  }
+}
+
+function crPick(id) {
+  crPinned$.set(true)
+  crOpen$.set(id)
+  crViewVersion$.set(null)
+  crDirty$.set(false)
+  crVersionGone$.set(false)
+}
+
+function CrHeader() {
+  const list = useValue(crList$)
+  const open = useValue(crOpen$)
+  const detail = useValue(crDetail$)
+  const vv = useValue(crViewVersion$)
+  const busy = useValue(crBusy$)
+  const [confirm, setConfirm] = useState(false)
+  const count = (detail && detail.version_count) || 1
+  const n = vv == null ? count : vv
+
+  const step = (to) => {
+    crDirty$.set(false)
+    crVersionGone$.set(false)
+    crViewVersion$.set(to >= count ? null : Math.max(1, to))
+    crPoll().catch(() => {}) // pull the picked version's content now, not in ~2s
+  }
+  const restore = () => {
+    if (!open) return
+    crBusy$.set(true)
+    crApi(crPath(open, '/versions'), { method: 'POST', body: { restore_from: n } })
+      .then(() => {
+        crViewVersion$.set(null)
+        crDirty$.set(false)
+        return crPoll()
+      })
+      .catch((e) => host.notifyError?.(e, 'Restore failed'))
+      .finally(() => crBusy$.set(false))
+  }
+
+  return jsxs('div', {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6,
+      padding: '6px 8px',
+      borderBottom: '1px solid rgba(128,128,128,0.2)',
+      flexWrap: 'wrap',
+    },
+    children: [
+      jsx('select', {
+        value: open || '',
+        onChange: (e) => crPick(e.target.value),
+        style: { flex: 1, minWidth: 120, maxWidth: 200, fontSize: 12, padding: '2px 4px' },
+        children: list.map((a) =>
+          jsx(
+            'option',
+            { value: a.identifier, children: `${a.in_session ? '● ' : ''}${a.title || a.identifier}` },
+            a.identifier,
+          ),
+        ),
+      }),
+      jsx('button', {
+        onClick: () => step(n - 1),
+        disabled: n <= 1,
+        title: 'Older version',
+        style: { fontSize: 12, padding: '0 4px' },
+        children: '◀',
+      }),
+      jsx('span', { style: { fontSize: 11, opacity: 0.7 }, children: `v${n}/${count}` }),
+      jsx('button', {
+        onClick: () => step(n + 1),
+        disabled: n >= count,
+        title: 'Newer version',
+        style: { fontSize: 12, padding: '0 4px' },
+        children: '▶',
+      }),
+      n >= count
+        ? jsx('span', { style: { fontSize: 10, opacity: 0.5 }, children: 'latest' })
+        : jsx(Button, { size: 'xs', variant: 'ghost', disabled: busy, onClick: restore, children: '↺ restore' }),
+      jsx(CopyButton, { appearance: 'icon', text: () => crContent$.get(), title: 'Copy content' }),
+      jsx(Button, {
+        size: 'xs',
+        variant: 'ghost',
+        disabled: !open || busy,
+        onClick: () => setConfirm(true),
+        children: 'Delete',
+      }),
+      jsx(ConfirmDialog, {
+        open: confirm,
+        onClose: () => setConfirm(false),
+        destructive: true,
+        title: 'Delete this artifact?',
+        description: 'Every version and its files are removed. This cannot be undone.',
+        confirmLabel: 'Delete',
+        onConfirm: async () => {
+          if (!open) return
+          await crApi(crPath(open), { method: 'DELETE' })
+          crOpen$.set(null)
+          crPinned$.set(false)
+          await crPoll()
+        },
+      }),
+    ],
+  })
+}
+
+function CrEditor() {
+  const content = useValue(crContent$)
+  const detail = useValue(crDetail$)
+  const vv = useValue(crViewVersion$)
+  const busy = useValue(crBusy$)
+  const dirty = useValue(crDirty$)
+  const [draft, setDraft] = useState(content)
+  const baseRef = useRef(content)
+  const count = (detail && detail.version_count) || 1
+  const readOnly = vv != null && vv < count
+
+  useEffect(() => {
+    setDraft(content)
+    baseRef.current = content
+    crDirty$.set(false)
+  }, [content])
+
+  const setBoth = (next) => {
+    setDraft(next)
+    crDirty$.set(next !== baseRef.current)
+  }
+  const save = () => {
+    const open = crOpen$.get()
+    if (!open || readOnly || !crDirty$.get()) return
+    crBusy$.set(true)
+    crApi(crPath(open, '/versions'), { method: 'POST', body: { content: draft } })
+      .then(() => {
+        baseRef.current = draft
+        crDirty$.set(false)
+        return crPoll()
+      })
+      .catch((e) => host.notifyError?.(e, 'Save failed'))
+      .finally(() => crBusy$.set(false))
+  }
+  const onKeyDown = (e) => {
+    if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+      e.preventDefault()
+      save()
+      return
+    }
+    if (e.key === 'Tab' && !readOnly) {
+      e.preventDefault()
+      const el = e.target
+      const s = el.selectionStart
+      const en = el.selectionEnd
+      const next = draft.slice(0, s) + '  ' + draft.slice(en)
+      setBoth(next)
+      requestAnimationFrame(() => {
+        try {
+          el.selectionStart = el.selectionEnd = s + 2
+        } catch {}
+      })
+    }
+  }
+
+  return jsxs('div', {
+    className: 'cr-cell',
+    style: { display: 'flex', flexDirection: 'column' },
+    children: [
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '4px 8px',
+          borderBottom: '1px solid rgba(128,128,128,0.15)',
+        },
+        children: [
+          jsx('span', {
+            style: { fontSize: 14, lineHeight: 1, color: 'var(--ui-accent, #6ab)', opacity: dirty ? 1 : 0 },
+            title: dirty ? 'Unsaved edits' : '',
+            children: '●',
+          }),
+          jsx('span', {
+            style: { flex: 1, fontSize: 11, opacity: 0.5 },
+            children: readOnly ? 'read-only · older version' : '',
+          }),
+          jsx(Button, { size: 'xs', disabled: readOnly || !dirty || busy, onClick: save, children: 'Save' }),
+        ],
+      }),
+      jsx(Textarea, {
+        className:
+          'block w-full resize-none rounded-none border-0 bg-transparent p-2.5 font-mono text-xs leading-relaxed shadow-none focus-visible:ring-0',
+        style: { flex: 1, minHeight: 140 },
+        value: draft,
+        readOnly,
+        spellCheck: false,
+        onKeyDown,
+        onChange: (e) => setBoth(e.target.value),
+      }),
+    ],
+  })
+}
+
+// Per-type preview (spec §5.11 table). `code` has no preview — the editor is
+// the view.
+function CrPreview() {
+  const detail = useValue(crDetail$)
+  const content = useValue(crContent$)
+  const type = (detail && detail.type) || 'code'
+  if (type === 'code') return null
+
+  let body
+  if (type === 'markdown') {
+    body = jsx(Streamdown, { children: content })
+  } else if (type === 'mermaid') {
+    body = jsx(Streamdown, { children: '```mermaid\n' + content + '\n```' })
+  } else if (type === 'html') {
+    body = jsx('iframe', {
+      className: 'cr-frame',
+      sandbox: 'allow-scripts',
+      srcDoc: crHtmlDoc(content),
+      title: 'HTML preview',
+    })
+  } else if (type === 'svg') {
+    body = jsx('img', {
+      src: `data:image/svg+xml;base64,${crB64(content)}`,
+      style: { maxWidth: '100%' },
+      alt: 'SVG preview',
+    })
+  } else {
+    body = jsx('div', { style: { padding: 12, fontSize: 12, opacity: 0.6 }, children: `No preview for “${type}”.` })
+  }
+
+  return jsx('div', {
+    className: 'cr-cell',
+    style: { padding: type === 'html' ? 0 : 12, fontSize: 13 },
+    children: body,
+  })
+}
+
+function CrVersionGone() {
+  return jsx('div', {
+    className: 'cr-cell',
+    style: { padding: 12, fontSize: 12, opacity: 0.7 },
+    children: 'This version is no longer available.',
+  })
+}
+
+function CreatorPane() {
+  const sid = useValue(crSid$)
+  const open = useValue(crOpen$)
+  const detail = useValue(crDetail$)
+  const gone = useValue(crVersionGone$)
+
+  useEffect(() => {
+    let live = true
+    const tick = () => {
+      if (live) crPoll().catch(() => {})
+    }
+    tick()
+    const id = setInterval(tick, 2000)
+    return () => {
+      live = false
+      clearInterval(id)
+    }
+  }, [])
+
+  let inner
+  if (!sid) {
+    inner = jsx('div', {
+      style: { padding: 16 },
+      children: jsx(EmptyState, {
+        title: 'No chat in focus',
+        description: 'Focus a saved chat to see the artifacts it created.',
+      }),
+    })
+  } else if (!open) {
+    inner = jsxs('div', {
+      style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'flex-start' },
+      children: [
+        jsx(EmptyState, {
+          title: 'No artifacts yet',
+          description: 'Ask the assistant to create one, or rescan this chat.',
+        }),
+        jsx(Button, {
+          size: 'sm',
+          onClick: () =>
+            crScan()
+              .then(() => crPoll())
+              .catch((e) => host.notifyError?.(e, 'Rescan failed')),
+          children: 'Rescan this chat',
+        }),
+      ],
+    })
+  } else {
+    const type = (detail && detail.type) || 'code'
+    inner = jsxs('div', {
+      style: { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 },
+      children: [
+        jsx(CrHeader, {}),
+        jsxs('div', {
+          className: 'cr-body',
+          children: [
+            jsx('style', { children: CR_CSS }),
+            jsx(CrErrorBoundary, {
+              children: gone
+                ? jsx(CrVersionGone, {})
+                : jsxs('div', {
+                    className: 'cr-split',
+                    children: [jsx(CrEditor, {}), type === 'code' ? null : jsx(CrPreview, {})],
+                  }),
+            }, open),
+          ],
+        }),
+      ],
+    })
+  }
+
+  return jsx('div', {
+    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, fontSize: 13 },
+    children: inner,
+  })
+}
+
+function CrStatusItem() {
+  const list = useValue(crList$)
+  const sid = useValue(crSid$)
+  if (!sid) return null
+  return jsxs('span', {
+    style: { display: 'inline-flex', alignItems: 'center', gap: 4, padding: '0 6px', fontSize: 11 },
+    title: 'Creator artifacts in this chat',
+    children: ['◆ Creator', list.length ? jsx('span', { style: { opacity: 0.6 }, children: String(list.length) }) : null],
+  })
+}
+
+function crRegister(ctx) {
+  crCtx = ctx
+  ctx.registerMany([
+    {
+      id: 'cr-pane',
+      area: PANES_AREA,
+      title: 'Creator',
+      data: {
+        placement: 'right',
+        width: '440px',
+        hideOnly: true,
+        collapsible: true,
+        dock: { pane: 'workspace', pos: 'right' },
+      },
+      render: () => jsx(CrErrorBoundary, { children: jsx(CreatorPane, {}) }),
+    },
+    {
+      id: 'cr-status',
+      area: STATUSBAR_AREAS.right,
+      order: 71,
+      render: () => jsx(CrStatusItem, {}),
+    },
+    {
+      id: 'cr-palette-open',
+      area: PALETTE_AREA,
+      data: {
+        id: 'hermes-workspace.open-creator',
+        label: 'Open Creator',
+        keywords: ['creator', 'artifact', 'preview', 'code'],
+        run: () => host.panes?.reveal?.('hermes-workspace.cr-pane'),
+      },
+    },
+    {
+      id: 'cr-palette-scan',
+      area: PALETTE_AREA,
+      data: {
+        id: 'hermes-workspace.creator-rescan',
+        label: 'Creator: rescan this chat',
+        keywords: ['creator', 'scan', 'artifact', 'rescan'],
+        run: () =>
+          crScan()
+            .then(() => host.notify({ kind: 'info', message: 'Rescanned' }))
+            .catch((e) => host.notifyError(e, 'Rescan failed')),
+      },
+    },
+  ])
+}
+
 export default {
   id: PLUGIN_ID,
   name: 'Knowledge',
@@ -1187,6 +1794,8 @@ export default {
             .catch((e) => host.notifyError(e, 'Reindex failed')),
       },
     })
+
+    try { crRegister(ctx) } catch (e) { host.notifyError?.(e, 'Creator failed to load') }
 
     // The extraction commands touch session.history + llm.oneshot. Gate them
     // on a one-time probe; the read path above is already wired and untouched.

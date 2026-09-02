@@ -1,6 +1,7 @@
 """Hermes Workspace — Knowledge module backend. Wiring only; logic lives in hw_*."""
 import datetime
 import difflib
+import logging
 import os
 import sys
 import uuid
@@ -371,3 +372,14 @@ def memories_history() -> list[dict]:
     return [{"batch_id": b["batch_id"], "ts": b["ts"],
              "notes": sorted({it["path"] for it in b["items"]}),
              "counts": len(b["items"])} for b in reversed(hw_merge._read_journal())]
+
+
+# --- Creator module mount ------------------------------------------------------
+# Separate backend (dashboard/cr_api.py + ../cr_store.py). Guarded and
+# best-effort: any import-time throw in cr_api / cr_store must leave every hw_*
+# route above mounted. Kept last so the hw_* routes come first in router.routes.
+try:
+    import cr_api  # noqa: E402
+    router.include_router(cr_api.router)
+except Exception as e:  # pragma: no cover - defensive
+    logging.getLogger(__name__).warning("creator API not mounted: %s", e)
