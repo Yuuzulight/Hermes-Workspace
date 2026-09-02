@@ -106,7 +106,8 @@ def _h_update(args, **kwargs):
 def _h_read(args, **kwargs):
     try:
         return tool_result(cr_store.do_read(args))
-    except (cr_store.StoreNotFound, cr_store.StoreBadInput, cr_store.StoreBusy) as e:
+    except (cr_store.StoreNotFound, cr_store.StoreBadInput, cr_store.StoreBusy,
+            cr_store.StoreGone) as e:
         return tool_error(str(e))
 
 
@@ -141,6 +142,14 @@ def _selfcheck() -> None:
             assert "created" in out
             bad = _h_update({"identifier": "missing", "content": "y"}, session_id="s1")
             assert "no artifact" in bad.lower()
+            good = _h_read({"identifier": "t"})
+            assert json.loads(good)["content"] == "x=1"
+            # Fix 5: a row-exists/file-missing artifact maps to a clean
+            # tool_error (StoreGone), not an unhandled FileNotFoundError.
+            meta = cr_store._meta("t")
+            os.remove(cr_store._creator_dir() / meta[0] / f"v{meta[6]}.{meta[7]}")
+            gone = _h_read({"identifier": "t"})
+            assert "error" in json.loads(gone)
     finally:
         if saved is None: os.environ.pop("HERMES_HOME", None)
         else: os.environ["HERMES_HOME"] = saved

@@ -61,6 +61,7 @@ TYPE_EXT = {
 VALID_TYPES = ("code", "html", "svg", "markdown", "mermaid")  # Task 23 adds "react"
 TRUNCATION_NOTE = "… (full content in the artifact)"
 OVERSIZE_NOTE = "open the Creator pane for the full artifact"
+MAX_BYTES = 1_000_000  # §5.6 write cap, shared by the tool path and the HTTP path
 _RETRIES = 3
 
 
@@ -308,6 +309,12 @@ def _cap(s: str, limit: int, note: str | None = None) -> str:
     return out + ("\n" + note if note else "")
 
 
+def _check_size(content: str) -> None:
+    """Shared §5.6 write cap: any write (tool or HTTP), content > 1 MB → error."""
+    if len(content.encode("utf-8")) > MAX_BYTES:
+        raise StoreBadInput(f"content too large (max {MAX_BYTES:,} bytes)")
+
+
 def record_session(identifier, session_id) -> None:
     """Link a session to an artifact without adding a version (§5.7 unchanged)."""
     if not session_id:
@@ -333,6 +340,7 @@ def do_create(args: dict, session_id: str) -> dict:
         raise StoreBadInput("create_artifact requires identifier, type, title, content")
     if type_ not in VALID_TYPES:
         raise StoreBadInput("type must be one of " + ", ".join(VALID_TYPES))
+    _check_size(content)
 
     exists = latest(ident) is not None
     source = "update" if exists else "create"
@@ -356,6 +364,7 @@ def do_update(args: dict, session_id: str) -> dict:
     content = args.get("content")
     if content is None:
         raise StoreBadInput("update_artifact requires identifier, content")
+    _check_size(content)
     prev = latest(ident)
     if prev is None:
         raise StoreNotFound(f"no artifact '{ident}' — call create_artifact first")
@@ -382,20 +391,24 @@ def do_update(args: dict, session_id: str) -> dict:
 
 
 def do_read(args: dict) -> dict:
-    """`read_artifact` dispatch (§5.6). Full content unless > 256 KB."""
+    """`read_artifact` dispatch (§5.6). Full content unless > 256 KB. Reuses
+    get_version() for the file read so a row-exists/file-missing artifact
+    raises StoreGone (like get_version's own callers) instead of an unguarded
+    FileNotFoundError."""
     ident = (args.get("identifier") or "").strip()
     row = _meta(ident)
     if row is None:
         raise StoreNotFound(f"no artifact '{ident}' — call create_artifact first")
     dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
-    text = (_creator_dir() / dir_ / f"v{maxn}.{maxn_ext}").read_text(
-        encoding="utf-8")
+    text = get_version(ident, maxn)["content"]
     out = {"identifier": ident, "version": maxn, "type": type_, "title": title,
            "version_count": vcount, "updated_at": updated_at}
     if len(text.encode("utf-8")) > 256 * 1024:
-        out["content"] = text.encode("utf-8")[:256 * 1024].decode("utf-8", "ignore")
+        # The note must live INSIDE content (not just a sibling key) so
+        # do_update's `OVERSIZE_NOTE in content` guard still fires if this
+        # truncated read is fed straight back into update_artifact.
+        out["content"] = _cap(text, 256 * 1024, OVERSIZE_NOTE)
         out["truncated"] = True
-        out["note"] = OVERSIZE_NOTE
     else:
         out["content"] = text
     return out
@@ -445,6 +458,7 @@ def edit_version(identifier, content) -> dict:
     `source='user-edit'` and a slim result; no session link (the pane has none)."""
     if content is None:
         raise StoreBadInput("edit_version requires content")
+    _check_size(content)
     prev = latest(identifier)
     if prev is None:
         raise StoreNotFound(f"no artifact '{identifier}'")
@@ -803,6 +817,42 @@ def _selfcheck() -> None:
             except StoreBadInput: pass
             r = do_read({"identifier": "doc"})
             assert r["version"] == 3 and r["content"] == "# hi\n\nchanged" and r["version_count"] == 3
+
+            # Fix 2: MAX_BYTES cap enforced on every write path, not just HTTP
+            big = "x" * (MAX_BYTES + 1)
+            try:
+                do_create({"identifier": "toobig", "type": "code", "title": "T",
+                          "content": big}, "s1"); assert False
+            except StoreBadInput: pass
+            try:
+                do_update({"identifier": "doc", "content": big}, "s1"); assert False
+            except StoreBadInput: pass
+            try:
+                edit_version("doc", big); assert False
+            except StoreBadInput: pass
+
+            # Fix 1: oversize truncation note lives IN content, not a sibling
+            # key — so a truncated read fed straight back into update_artifact
+            # is caught by do_update's own `OVERSIZE_NOTE in content` guard.
+            do_create({"identifier": "huge", "type": "code", "title": "Huge",
+                      "content": "y" * (300 * 1024)}, "s1")
+            hr = do_read({"identifier": "huge"})
+            assert hr["truncated"] is True
+            assert OVERSIZE_NOTE in hr["content"]
+            try:
+                do_update({"identifier": "huge", "content": hr["content"]}, "s1"); assert False
+            except StoreBadInput: pass
+
+            # Fix 5: do_read on a row-exists/file-missing artifact raises
+            # StoreGone (like get_version), not a raw FileNotFoundError.
+            do_create({"identifier": "vanish", "type": "markdown", "title": "V",
+                      "content": "body"}, "s1")
+            meta = _meta("vanish")
+            os.remove(_creator_dir() / meta[0] / f"v{meta[6]}.{meta[7]}")
+            try:
+                do_read({"identifier": "vanish"}); assert False
+            except StoreGone: pass
+
             # session recorded even on unchanged (fresh id, not touched by v1-v3 writes)
             conn = _connect()
             try:

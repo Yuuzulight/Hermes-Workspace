@@ -15,8 +15,6 @@ _s.loader.exec_module(cr_store)  # safe: _selfcheck() is under __main__
 
 router = APIRouter(prefix="/creator")
 
-MAX_BYTES = 1_000_000
-
 _STATUS = {
     cr_store.StoreNotFound: 404,
     cr_store.StoreGone: 410,
@@ -77,7 +75,10 @@ def create_version(id: str, body: VersionBody):
         raise HTTPException(status_code=400,
                             detail="provide exactly one of content, restore_from")
     if has_content:
-        if len(body.content.encode("utf-8")) > MAX_BYTES:
+        # Fast path (cheaper than round-tripping to do_create/edit_version);
+        # cr_store.MAX_BYTES is the single source of truth for the §5.6 cap —
+        # edit_version() enforces the same limit itself either way.
+        if len(body.content.encode("utf-8")) > cr_store.MAX_BYTES:
             return JSONResponse(status_code=400, content={"error": "too_large"})
         return cr_store.edit_version(id, body.content)
     r = cr_store.restore(id, body.restore_from, "")
