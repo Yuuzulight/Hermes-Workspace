@@ -1520,13 +1520,16 @@ function require(name) {
 
 // Minimal inline ErrorBoundary (spec §6.3/§6.4) — wraps the artifact render so
 // a render-time error shows a fallback instead of leaving a blank frame.
-// componentDidCatch is a marked no-op: Task 22 wires it into the postMessage
-// error bridge (crBridgeScript).
+// componentDidCatch also reports through the bridge (window.__crReportError,
+// installed first by crBridgeScript below) so the host pane's CrErrorStrip
+// sees it too, not just the in-frame fallback.
 const CR_ERROR_BOUNDARY_SRC = `
 class ErrorBoundary extends React.Component {
   constructor(props) { super(props); this.state = { error: null } }
   static getDerivedStateFromError(error) { return { error } }
-  componentDidCatch(error, info) { /* Task 22: crBridgeScript posts this */ }
+  componentDidCatch(error, info) {
+    try { window.__crReportError && window.__crReportError(error) } catch (e) {}
+  }
   render() {
     if (this.state.error) {
       return React.createElement('pre', {
@@ -1537,6 +1540,52 @@ class ErrorBoundary extends React.Component {
   }
 }
 `
+
+// Task 22 (spec §6.4): the preview iframe's error + console postMessage
+// bridge. Spliced as the VERY FIRST <script> in the srcdoc (crReactSrcdoc,
+// below) — before the React-globals scripts and before the bundle script —
+// so window.onerror/onunhandledrejection are installed before anything else
+// in the frame can run, catching a synchronous top-level throw in the bundle
+// itself and any async error in the gap that would otherwise exist. Kept as
+// one string (not a template literal with real newlines mattering) since it
+// runs as classic inline JS inside the sandboxed srcdoc, same trick as
+// CR_ERROR_BOUNDARY_SRC above.
+function crBridgeScript(nonce) {
+  const token = JSON.stringify(String(nonce || ''))
+  return `
+(function () {
+  var TOKEN = ${token}
+  function post(msg) { try { parent.postMessage(msg, '*') } catch (e) {} }
+  function safe(v) {
+    try {
+      if (v instanceof Error) return v.stack || v.message
+      if (typeof v === 'object' && v !== null) return JSON.stringify(v)
+      return String(v)
+    } catch (e) { return String(v) }
+  }
+  window.onerror = function (message, source, lineno, colno, err) {
+    post({ type: 'cr-error', token: TOKEN, message: String(message), stack: err && err.stack, line: lineno, col: colno })
+  }
+  window.onunhandledrejection = function (event) {
+    var reason = event && event.reason
+    post({ type: 'cr-error', token: TOKEN, message: safe(reason), stack: reason && reason.stack })
+  }
+  // window.__crReportError: called by ErrorBoundary.componentDidCatch (React
+  // catches render errors itself; window.onerror never sees those).
+  window.__crReportError = function (error) {
+    post({ type: 'cr-error', token: TOKEN, message: safe(error), stack: error && error.stack })
+  }
+  ;['log', 'warn', 'error', 'info', 'debug'].forEach(function (level) {
+    var orig = console[level]
+    console[level] = function () {
+      var args = Array.prototype.slice.call(arguments).map(safe)
+      post({ type: 'cr-console', token: TOKEN, level: level, args: args })
+      return orig.apply(console, arguments)
+    }
+  })
+})();
+`
+}
 
 // srcdoc script tags can't contain a literal "</script" — the HTML tokenizer
 // matches it regardless of JS string/comment context, so bundle text built
@@ -1550,9 +1599,13 @@ function crEscapeScriptClose(s) {
 // via React. `bundle`/`css` are handed in already-built by the caller; this
 // only inlines them, plus the React/ReactDOM globals the bootstrap needs (see
 // crVfsPlugin and CR_REACT_REQUIRE_SHIM above for why those can't just come
-// from the bundle itself). `nonce`/`injectRuntime` are Task 22's error+
-// console bridge placeholders: when injectRuntime is set, a marked splice
-// point is left for crBridgeScript(nonce); the bridge itself isn't wired yet.
+// from the bundle itself). `nonce`/`injectRuntime` drive Task 22's error +
+// console bridge: when injectRuntime is set, crBridgeScript(nonce) is
+// spliced in as the VERY FIRST <script> — before the React-globals scripts,
+// before the bundle script, before the bootstrap — per the Task 21 review
+// finding that the bootstrap-tag splice point ran too late to catch a
+// synchronous top-level throw in the bundle or an async error in the gap
+// before window.onerror was patched.
 async function crReactSrcdoc({ bundle, css, nonce, injectRuntime }) {
   const [reactSrc, reactDomBaseSrc, reactDomSrc] = await Promise.all([
     crReactGlobalScript('react.js', 'React'),
@@ -1560,11 +1613,10 @@ async function crReactSrcdoc({ bundle, css, nonce, injectRuntime }) {
     crReactGlobalScript('react-dom-client.js', 'ReactDOM'),
   ])
   const prelude = crThemePrelude()
-  const bridgePlaceholder = injectRuntime
-    ? `\n// Task 22 splices crBridgeScript(${JSON.stringify(nonce || '')}) here (error + console postMessage bridge, spec §6.4).\n`
-    : ''
+  const bridgeScript = injectRuntime ? `<script>${crBridgeScript(nonce)}</script>` : ''
   return (
     '<!doctype html><meta charset="utf-8">' +
+    bridgeScript +
     prelude +
     `<style>${css || ''}</style>` +
     '<div id="root"></div>' +
@@ -1575,7 +1627,6 @@ async function crReactSrcdoc({ bundle, css, nonce, injectRuntime }) {
     `<script>${crEscapeScriptClose(bundle)}</script>` +
     '<script>' +
     CR_ERROR_BOUNDARY_SRC +
-    bridgePlaceholder +
     `
 try {
   ReactDOM.createRoot(document.getElementById('root')).render(
@@ -1831,7 +1882,10 @@ function CrEditor() {
 // build-in-an-effect state below). Re-keyed on the bundle's content hash so a
 // bundle change remounts a fresh iframe rather than React trying to diff a
 // changed srcDoc in place (an iframe never re-evaluates a changed srcDoc).
-function CrReactFrame({ bundle, css, nonce, injectRuntime }) {
+// `frameRef` (Task 22) is forwarded onto the <iframe> so a caller can pass it
+// straight to crUseFrameBridge(frameRef, nonce, …) to validate that incoming
+// postMessages come from THIS iframe, not any other window.
+function CrReactFrame({ bundle, css, nonce, injectRuntime, frameRef }) {
   const [built, setBuilt] = useState(null) // {hash, srcDoc} | null while building
 
   useEffect(() => {
@@ -1857,10 +1911,131 @@ function CrReactFrame({ bundle, css, nonce, injectRuntime }) {
   if (!built) return null
   return jsx('iframe', {
     key: built.hash,
+    ref: frameRef,
     className: 'cr-frame',
     sandbox: 'allow-scripts',
     srcDoc: built.srcDoc,
     title: 'React preview',
+  })
+}
+
+// Task 22 (spec §6.4): listens for the crBridgeScript postMessages from one
+// specific preview iframe and forwards validated cr-error/cr-console events
+// to the caller. Three checks gate every message before anything in it is
+// trusted: known `type`, matching `token` (the nonce is the trust boundary —
+// a message can only carry the current build's nonce if it came from code
+// crBridgeScript itself installed), and `event.source` pointing at exactly
+// this iframe's contentWindow (so another frame/window posting to the parent
+// can't spoof one, even with a stale/reused nonce). Every field read out of
+// msg is still re-typed/clamped below — a compromised artifact can call
+// postMessage directly with a correct type+token+source and an oversized or
+// malformed payload, and that shouldn't be able to bloat the console pane or
+// hand a non-string into rendering.
+function crUseFrameBridge(frameRef, nonce, { onError, onConsole } = {}) {
+  useEffect(() => {
+    const clampStr = (v, max) => String(v == null ? '' : v).slice(0, max)
+    function handler(event) {
+      const msg = event.data
+      if (!msg || typeof msg !== 'object') return
+      if (msg.type !== 'cr-error' && msg.type !== 'cr-console') return
+      if (msg.token !== nonce) return
+      if (event.source !== frameRef.current?.contentWindow) return
+
+      if (msg.type === 'cr-error') {
+        onError?.({
+          message: clampStr(msg.message, 2000),
+          stack: msg.stack ? clampStr(msg.stack, 4000) : null,
+          line: Number.isFinite(msg.line) ? msg.line : null,
+          col: Number.isFinite(msg.col) ? msg.col : null,
+        })
+      } else {
+        const level = ['log', 'warn', 'error', 'info', 'debug'].includes(msg.level) ? msg.level : 'log'
+        const args = Array.isArray(msg.args) ? msg.args.slice(0, 20).map((a) => clampStr(a, 500)) : []
+        onConsole?.({ level, args })
+      }
+    }
+    window.addEventListener('message', handler)
+    return () => window.removeEventListener('message', handler)
+  }, [frameRef, nonce, onError, onConsole])
+}
+
+// Latest render/runtime error surfaced above the preview frame (spec §6.4).
+// Purely controlled: the caller owns the error state (fed by crUseFrameBridge
+// / CrReactFrame's own build-error catch) and clears it — e.g. back to null
+// when a new build starts, or by keying this component on the bundle hash
+// like CrReactFrame keys its <iframe> — so a fixed artifact's next successful
+// mount drops the strip instead of it lingering.
+function CrErrorStrip({ error }) {
+  if (!error) return null
+  return jsx('div', {
+    style: {
+      padding: '6px 8px',
+      fontSize: 11,
+      lineHeight: 1.4,
+      color: '#e5484d',
+      background: 'rgba(229,72,77,0.1)',
+      borderBottom: '1px solid rgba(229,72,77,0.3)',
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+    },
+    children: `Render error: ${error.message || error}`,
+  })
+}
+
+const CR_CONSOLE_COLORS = { error: '#e5484d', warn: '#f5a623', info: '#5b9dd9', log: 'inherit', debug: 'inherit' }
+
+// Plain <pre> console scrollback (spec §6.4). `event` is the latest single
+// cr-console message (a new object each time, from crUseFrameBridge's
+// onConsole) — appended to an internal ~300-line ring buffer on change, so
+// the caller doesn't have to lift the whole log into its own state. Clear
+// empties the buffer; a `console.error` line is colored the same as
+// CrErrorStrip so it reads as the same severity in both places.
+function CrConsolePane({ event }) {
+  const [entries, setEntries] = useState([])
+
+  useEffect(() => {
+    if (!event) return
+    setEntries((prev) => {
+      const next = prev.length >= 300 ? prev.slice(prev.length - 299) : prev.slice()
+      next.push(event)
+      return next
+    })
+  }, [event])
+
+  return jsxs('div', {
+    className: 'cr-cell',
+    style: { display: 'flex', flexDirection: 'column', minHeight: 0 },
+    children: [
+      jsx('div', {
+        style: {
+          display: 'flex',
+          justifyContent: 'flex-end',
+          padding: '2px 4px',
+          borderBottom: '1px solid rgba(128,128,128,0.15)',
+        },
+        children: jsx(Button, { size: 'xs', variant: 'ghost', disabled: !entries.length, onClick: () => setEntries([]), children: 'Clear' }),
+      }),
+      jsx('pre', {
+        style: {
+          flex: 1,
+          minHeight: 0,
+          overflow: 'auto',
+          margin: 0,
+          padding: '4px 8px',
+          fontSize: 11,
+          fontFamily: 'monospace',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+        },
+        children: entries.map((e, i) =>
+          jsx(
+            'div',
+            { style: { color: CR_CONSOLE_COLORS[e.level] || 'inherit' }, children: `[${e.level}] ${e.args.join(' ')}` },
+            i,
+          ),
+        ),
+      }),
+    ],
   })
 }
 
