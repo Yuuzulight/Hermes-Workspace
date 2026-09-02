@@ -1237,14 +1237,31 @@ function crThemePrelude() {
 }
 
 function crHtmlDoc(html) {
+  const src = html || ''
   const prelude = crThemePrelude()
-  if (/<html[\s>]/i.test(html || '')) return prelude + html
+  if (/<html[\s>]/i.test(src)) {
+    // Full document — the doctype must stay the first token or the browser
+    // renders in quirks mode, so splice the prelude in rather than prepend it.
+    // Prefer just inside <head…>; else right after <!doctype …>; else (no
+    // doctype, no head — rare) fall back to a raw prepend.
+    const headOpen = /<head[^>]*>/i.exec(src)
+    if (headOpen) {
+      const at = headOpen.index + headOpen[0].length
+      return src.slice(0, at) + prelude + src.slice(at)
+    }
+    const doctype = /^\s*<!doctype\s[^>]*>/i.exec(src)
+    if (doctype) {
+      const at = doctype.index + doctype[0].length
+      return src.slice(0, at) + prelude + src.slice(at)
+    }
+    return prelude + src
+  }
   // Fragment → minimal doc + reset.
   return (
     '<!doctype html><meta charset="utf-8">' +
     prelude +
     '<style>*,*::before,*::after{box-sizing:border-box}body{margin:12px;color:var(--foreground,inherit)}</style>' +
-    (html || '')
+    src
   )
 }
 
