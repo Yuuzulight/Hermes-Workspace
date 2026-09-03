@@ -5,7 +5,7 @@
 // bundled by build.mjs's LIBS loop like any other lib.
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection } from '@codemirror/view'
 import { EditorState, Compartment } from '@codemirror/state'
-import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { syntaxHighlighting, defaultHighlightStyle, bracketMatching, indentOnInput } from '@codemirror/language'
 import { search, searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete'
@@ -45,7 +45,9 @@ function basicExtensions(lang, dark) {
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     ...(langExt ? [langExt()] : []),
     ...(dark ? [oneDark] : []),
-    keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...completionKeymap]),
+    // indentWithTab last, per CM6 convention, so it doesn't shadow more specific
+    // bindings (search/completion/etc.) earlier in the array.
+    keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...completionKeymap, indentWithTab]),
   ]
 }
 

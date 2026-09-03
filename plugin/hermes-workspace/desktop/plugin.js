@@ -2157,7 +2157,20 @@ function CrCmEditor({ value, language, readOnly, onChange, onSave }) {
       roCompartmentRef.current = roCompartment
       viewRef.current = new cm.EditorView({
         doc: propsRef.current.value || '',
-        extensions: [...crCmExtensions(cm, { ...propsRef.current, dark }), roCompartment.of(cm.readOnly(!!propsRef.current.readOnly))],
+        // onChange/onSave read through propsRef.current AT CALL TIME instead of being
+        // destructured here — this effect only runs once on mount, so destructuring
+        // would freeze these callbacks at their mount-time closures forever (the
+        // final-review Fix 1 bug: Mod-s kept saving stale pre-edit content). language/
+        // dark are fine to freeze — they don't change per-render like onChange/onSave do.
+        extensions: [
+          ...crCmExtensions(cm, {
+            language: propsRef.current.language,
+            dark,
+            onChange: (v) => propsRef.current.onChange?.(v),
+            onSave: () => propsRef.current.onSave?.(),
+          }),
+          roCompartment.of(cm.readOnly(!!propsRef.current.readOnly)),
+        ],
         parent: hostRef.current,
       })
       setCmOk(true)
@@ -2202,6 +2215,23 @@ function CrCmEditor({ value, language, readOnly, onChange, onSave }) {
             if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
               e.preventDefault()
               onSave?.()
+              return
+            }
+            // Tab-to-indent restored for the plain-textarea fallback (the pre-Task-28
+            // Textarea editor had this; CM6's basicExtensions keymap covers the rich
+            // editor path — see codemirror-entry.js's indentWithTab).
+            if (e.key === 'Tab' && !readOnly) {
+              e.preventDefault()
+              const el = e.target
+              const s = el.selectionStart
+              const en = el.selectionEnd
+              const next = (value || '').slice(0, s) + '  ' + (value || '').slice(en)
+              onChange?.(next)
+              requestAnimationFrame(() => {
+                try {
+                  el.selectionStart = el.selectionEnd = s + 2
+                } catch {}
+              })
             }
           },
         }),
