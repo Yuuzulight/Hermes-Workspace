@@ -57,8 +57,8 @@ output). The exported file works fully offline — open it directly in any
 browser, no server involved.
 
 **Publish** — the "Publish" button posts the same standalone HTML to a
-public GitHub Gist via the `gh` CLI and returns a shareable URL (+ a raw-html
-render link for `html`/`react` artifacts). `gh` is **optional**: if it isn't
+public GitHub Gist via the `gh` CLI and returns a shareable URL; a raw-render
+link is also returned for every published type. `gh` is **optional**: if it isn't
 installed and authenticated, Publish doesn't fail silently — it shows a
 notice explaining how to enable it (`install gh and run gh auth login, or
 set a token in Creator settings`).

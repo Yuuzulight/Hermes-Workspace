@@ -1682,11 +1682,21 @@ try {
 // a bridge-free, fully standalone doc (theme prelude + css + bundle + the
 // same ErrorBoundary bootstrap the preview uses).
 async function crAssembleReactHtml(source) {
-  const built = await crBundle(source)
+  // Fix 5 (final review): reuse crReactBuild's cached source -> {code, css}
+  // instead of calling crBundle+crTailwind directly — an identical-source
+  // preview is usually already warm in crReactBuild's cache, so Export/
+  // Publish no longer always re-run esbuild-wasm + a full Tailwind compile.
+  const built = await crReactBuild(source)
   if (!built.ok) return { ok: false, errors: built.errors }
-  const css = await crTailwind(built.code, null, source)
-  const html = await crReactSrcdoc({ bundle: built.code, css })
-  return { ok: true, html }
+  const html = await crReactSrcdoc({ bundle: built.code, css: built.css })
+  // Fix 2 (final review): crThemePrelude sets background:transparent (correct
+  // for the live preview iframe, painted over by the pane behind it) and
+  // resolves --foreground from the live theme at export time. A standalone
+  // exported .html opened in a plain browser tab has no pane behind it, so in
+  // a dark Hermes theme this reads as near-white text on the browser's
+  // default white background. Supply a real background using the same
+  // --card token the prelude already resolves (--ui-bg-editor).
+  return { ok: true, html: html + '<style>html,body{background:var(--card,#ffffff)}</style>' }
 }
 
 // Standalone export (spec §7.2). Non-react types are wrapped server-side;
@@ -1768,6 +1778,17 @@ function crPick(id) {
   crVersionGone$.set(false)
 }
 
+// Fix 6 (final review): Electron's shell.openExternal needs a real URL with a
+// scheme — a bare filesystem path like exportResult.path (e.g. `D:\...\foo.html`)
+// gets misparsed. Converts a local path to a file:// URL; doesn't need to be
+// bulletproof, just correct for the common Windows-backslash and POSIX-slash
+// cases (Publish's own result is already a real https:// gist URL and is
+// never passed through this).
+function crFileUrl(p) {
+  const s = String(p || '').replace(/\\/g, '/')
+  return 'file://' + (s.startsWith('/') ? '' : '/') + s
+}
+
 function CrHeader() {
   const list = useValue(crList$)
   const open = useValue(crOpen$)
@@ -1779,6 +1800,16 @@ function CrHeader() {
   const [publishResult, setPublishResult] = useState(null) // {url,raw_url} | {error,how} | {error:'needs_pane'} | {errors} | null
   const count = (detail && detail.version_count) || 1
   const n = vv == null ? count : vv
+
+  // Fold-in Minor A (final review): CrHeader sits outside the `key={open}`
+  // remount boundary (see CreatorPane's CrErrorBoundary), so without this the
+  // previous artifact's export/publish result strip kept showing after
+  // switching artifacts — with its OS-action buttons then targeting the
+  // wrong file.
+  useEffect(() => {
+    setExportResult(null)
+    setPublishResult(null)
+  }, [open])
 
   const doExport = () => {
     if (!open) return
@@ -1924,7 +1955,7 @@ function CrHeader() {
                 jsx(Button, {
                   size: 'xs',
                   variant: 'ghost',
-                  onClick: () => tryOsAction('openExternal', exportResult.path, 'Open in browser'),
+                  onClick: () => tryOsAction('openExternal', crFileUrl(exportResult.path), 'Open in browser'),
                   children: 'Open in browser',
                 }),
               ],
@@ -1973,6 +2004,15 @@ function CrHeader() {
                   onClick: () => tryOsAction('openExternal', publishResult.url, 'Open in browser'),
                   children: 'Open in browser',
                 }),
+                // Fold-in Minor B (final review): raw_url is returned for every
+                // published type (cr_store.py's publish_artifact), but the UI never
+                // rendered it — add the same copy affordance the gist `url` gets.
+                publishResult.raw_url
+                  ? jsx('span', { style: { opacity: 0.5 }, children: 'raw:' })
+                  : null,
+                publishResult.raw_url
+                  ? jsx(CopyButton, { appearance: 'icon', text: () => publishResult.raw_url, title: 'Copy raw-render link' })
+                  : null,
               ],
         })
       : null,
