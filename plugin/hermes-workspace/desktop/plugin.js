@@ -1275,6 +1275,7 @@ async function crBundle(source) {
       jsx: 'automatic',
       jsxImportSource: 'react',
       write: false,
+      minify: true,
       plugins: [crVfsPlugin(manifest)],
     })
     result = { ok: true, code: built.outputFiles[0].text }
@@ -1673,6 +1674,63 @@ try {
   )
 }
 
+// Shared by crExport and crPublish (Task 32): assembles a standalone,
+// bridge-free react doc from the same crBundle/crTailwind pieces the live
+// preview (crReactBuild) uses. crReactSrcdoc splices crBridgeScript (the
+// postMessage bridge to the pane) only when its `injectRuntime` param is
+// truthy, so calling it here with no `nonce`/`injectRuntime` already yields
+// a bridge-free, fully standalone doc (theme prelude + css + bundle + the
+// same ErrorBoundary bootstrap the preview uses).
+async function crAssembleReactHtml(source) {
+  // Fix 5 (final review): reuse crReactBuild's cached source -> {code, css}
+  // instead of calling crBundle+crTailwind directly — an identical-source
+  // preview is usually already warm in crReactBuild's cache, so Export/
+  // Publish no longer always re-run esbuild-wasm + a full Tailwind compile.
+  const built = await crReactBuild(source)
+  if (!built.ok) return { ok: false, errors: built.errors }
+  const html = await crReactSrcdoc({ bundle: built.code, css: built.css })
+  // Fix 2 (final review): crThemePrelude sets background:transparent (correct
+  // for the live preview iframe, painted over by the pane behind it) and
+  // resolves --foreground from the live theme at export time. A standalone
+  // exported .html opened in a plain browser tab has no pane behind it, so in
+  // a dark Hermes theme this reads as near-white text on the browser's
+  // default white background. Supply a real background using the same
+  // --card token the prelude already resolves (--ui-bg-editor).
+  return { ok: true, html: html + '<style>html,body{background:var(--card,#ffffff)}</style>' }
+}
+
+// Standalone export (spec §7.2). Non-react types are wrapped server-side;
+// react is assembled via crAssembleReactHtml, then persisted via the
+// /export/bundle route.
+async function crExport(id, detail, source) {
+  if (detail && detail.type === 'react') {
+    const assembled = await crAssembleReactHtml(source)
+    if (!assembled.ok) return { ok: false, errors: assembled.errors }
+    const r = await crApi(crPath(id, '/export/bundle'), { method: 'POST', body: { html: assembled.html } })
+    return { ok: true, path: r.path }
+  }
+  const r = await crApi(crPath(id, '/export'), { method: 'POST', body: {} })
+  return { ok: true, path: r.path }
+}
+
+// Publish to Gist (spec §7.3, task-31's POST .../publish). Non-react types
+// are exported+published server-side (no html sent); react sends the same
+// assembled doc crExport writes to disk, so the gist and the exported file
+// are byte-identical. Passes the backend's response through verbatim —
+// {url, raw_url} on success, {error: 'github_not_configured', how} or
+// {error: 'needs_pane'} on expected/recoverable failures (task-31 design;
+// the 'errors' key below is this function's own client-side bundle-failure
+// case, kept distinct from the server's 'error' key so the UI can tell a
+// local bundle failure apart from a server-reported condition).
+async function crPublish(id, detail, source) {
+  if (detail && detail.type === 'react') {
+    const assembled = await crAssembleReactHtml(source)
+    if (!assembled.ok) return { errors: assembled.errors }
+    return crApi(crPath(id, '/publish'), { method: 'POST', body: { html: assembled.html } })
+  }
+  return crApi(crPath(id, '/publish'), { method: 'POST', body: {} })
+}
+
 function crB64(s) {
   const bytes = new TextEncoder().encode(String(s || ''))
   let bin = ''
@@ -1720,6 +1778,17 @@ function crPick(id) {
   crVersionGone$.set(false)
 }
 
+// Fix 6 (final review): Electron's shell.openExternal needs a real URL with a
+// scheme — a bare filesystem path like exportResult.path (e.g. `D:\...\foo.html`)
+// gets misparsed. Converts a local path to a file:// URL; doesn't need to be
+// bulletproof, just correct for the common Windows-backslash and POSIX-slash
+// cases (Publish's own result is already a real https:// gist URL and is
+// never passed through this).
+function crFileUrl(p) {
+  const s = String(p || '').replace(/\\/g, '/')
+  return 'file://' + (s.startsWith('/') ? '' : '/') + s
+}
+
 function CrHeader() {
   const list = useValue(crList$)
   const open = useValue(crOpen$)
@@ -1727,8 +1796,46 @@ function CrHeader() {
   const vv = useValue(crViewVersion$)
   const busy = useValue(crBusy$)
   const [confirm, setConfirm] = useState(false)
+  const [exportResult, setExportResult] = useState(null) // {path} | {errors} | null
+  const [publishResult, setPublishResult] = useState(null) // {url,raw_url} | {error,how} | {error:'needs_pane'} | {errors} | null
   const count = (detail && detail.version_count) || 1
   const n = vv == null ? count : vv
+
+  // Fold-in Minor A (final review): CrHeader sits outside the `key={open}`
+  // remount boundary (see CreatorPane's CrErrorBoundary), so without this the
+  // previous artifact's export/publish result strip kept showing after
+  // switching artifacts — with its OS-action buttons then targeting the
+  // wrong file.
+  useEffect(() => {
+    setExportResult(null)
+    setPublishResult(null)
+  }, [open])
+
+  const doExport = () => {
+    if (!open) return
+    setExportResult(null)
+    crBusy$.set(true)
+    crExport(open, detail, crContent$.get())
+      .then(setExportResult)
+      .catch((e) => host.notifyError?.(e, 'Export failed'))
+      .finally(() => crBusy$.set(false))
+  }
+  const doPublish = () => {
+    if (!open) return
+    setPublishResult(null)
+    crBusy$.set(true)
+    crPublish(open, detail, crContent$.get())
+      .then(setPublishResult)
+      .catch((e) => host.notifyError?.(e, 'Publish failed'))
+      .finally(() => crBusy$.set(false))
+  }
+  // Calls crCtx.os[method](path) — NOT a detached `crCtx.os.revealPath` reference,
+  // so `this` stays bound if the host implementation relies on it.
+  const tryOsAction = (method, path, label) => {
+    if (!crCtx.os[method](path)) {
+      host.notifyError?.(new Error(`${label} is not available here — copy the path instead.`), label)
+    }
+  }
 
   const step = (to) => {
     crDirty$.set(false)
@@ -1750,70 +1857,193 @@ function CrHeader() {
   }
 
   return jsxs('div', {
-    style: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 6,
-      padding: '6px 8px',
-      borderBottom: '1px solid rgba(128,128,128,0.2)',
-      flexWrap: 'wrap',
-    },
-    children: [
-      jsx('select', {
-        value: open || '',
-        onChange: (e) => crPick(e.target.value),
-        style: { flex: 1, minWidth: 120, maxWidth: 200, fontSize: 12, padding: '2px 4px' },
-        children: list.map((a) =>
-          jsx(
-            'option',
-            { value: a.identifier, children: `${a.in_session ? '● ' : ''}${a.title || a.identifier}` },
-            a.identifier,
+    style: { display: 'flex', flexDirection: 'column' },
+    children: [jsxs('div', {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '6px 8px',
+        borderBottom: '1px solid rgba(128,128,128,0.2)',
+        flexWrap: 'wrap',
+      },
+      children: [
+        jsx('select', {
+          value: open || '',
+          onChange: (e) => crPick(e.target.value),
+          style: { flex: 1, minWidth: 120, maxWidth: 200, fontSize: 12, padding: '2px 4px' },
+          children: list.map((a) =>
+            jsx(
+              'option',
+              { value: a.identifier, children: `${a.in_session ? '● ' : ''}${a.title || a.identifier}` },
+              a.identifier,
+            ),
           ),
-        ),
-      }),
-      jsx('button', {
-        onClick: () => step(n - 1),
-        disabled: n <= 1,
-        title: 'Older version',
-        style: { fontSize: 12, padding: '0 4px' },
-        children: '◀',
-      }),
-      jsx('span', { style: { fontSize: 11, opacity: 0.7 }, children: `v${n}/${count}` }),
-      jsx('button', {
-        onClick: () => step(n + 1),
-        disabled: n >= count,
-        title: 'Newer version',
-        style: { fontSize: 12, padding: '0 4px' },
-        children: '▶',
-      }),
-      n >= count
-        ? jsx('span', { style: { fontSize: 10, opacity: 0.5 }, children: 'latest' })
-        : jsx(Button, { size: 'xs', variant: 'ghost', disabled: busy, onClick: restore, children: '↺ restore' }),
-      jsx(CopyButton, { appearance: 'icon', text: () => crContent$.get(), title: 'Copy content' }),
-      jsx(Button, {
-        size: 'xs',
-        variant: 'ghost',
-        disabled: !open || busy,
-        onClick: () => setConfirm(true),
-        children: 'Delete',
-      }),
-      jsx(ConfirmDialog, {
-        open: confirm,
-        onClose: () => setConfirm(false),
-        destructive: true,
-        title: 'Delete this artifact?',
-        description: 'Every version and its files are removed. This cannot be undone.',
-        confirmLabel: 'Delete',
-        onConfirm: async () => {
-          if (!open) return
-          await crApi(crPath(open), { method: 'DELETE' })
-          crOpen$.set(null)
-          crPinned$.set(false)
-          await crPoll()
-        },
-      }),
+        }),
+        jsx('button', {
+          onClick: () => step(n - 1),
+          disabled: n <= 1,
+          title: 'Older version',
+          style: { fontSize: 12, padding: '0 4px' },
+          children: '◀',
+        }),
+        jsx('span', { style: { fontSize: 11, opacity: 0.7 }, children: `v${n}/${count}` }),
+        jsx('button', {
+          onClick: () => step(n + 1),
+          disabled: n >= count,
+          title: 'Newer version',
+          style: { fontSize: 12, padding: '0 4px' },
+          children: '▶',
+        }),
+        n >= count
+          ? jsx('span', { style: { fontSize: 10, opacity: 0.5 }, children: 'latest' })
+          : jsx(Button, { size: 'xs', variant: 'ghost', disabled: busy, onClick: restore, children: '↺ restore' }),
+        jsx(CopyButton, { appearance: 'icon', text: () => crContent$.get(), title: 'Copy content' }),
+        jsx(Button, {
+          size: 'xs',
+          variant: 'ghost',
+          disabled: !open || busy,
+          onClick: () => setConfirm(true),
+          children: 'Delete',
+        }),
+        jsx(ConfirmDialog, {
+          open: confirm,
+          onClose: () => setConfirm(false),
+          destructive: true,
+          title: 'Delete this artifact?',
+          description: 'Every version and its files are removed. This cannot be undone.',
+          confirmLabel: 'Delete',
+          onConfirm: async () => {
+            if (!open) return
+            await crApi(crPath(open), { method: 'DELETE' })
+            crOpen$.set(null)
+            crPinned$.set(false)
+            await crPoll()
+          },
+        }),
+        jsx(Button, { size: 'xs', variant: 'ghost', disabled: !open || busy, onClick: doExport, children: 'Export' }),
+        jsx(Button, { size: 'xs', variant: 'ghost', disabled: !open || busy, onClick: doPublish, children: 'Publish' }),
+      ],
+    }),
+    exportResult
+      ? jsxs('div', {
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '4px 8px',
+            borderBottom: '1px solid rgba(128,128,128,0.15)',
+            flexWrap: 'wrap',
+            fontSize: 11,
+          },
+          children: exportResult.errors
+            ? [
+                jsx('span', {
+                  style: { color: '#e5484d', whiteSpace: 'pre-wrap' },
+                  children: `Export failed: ${exportResult.errors}`,
+                }),
+              ]
+            : [
+                jsx('span', { style: { opacity: 0.7 }, children: `Exported: ${exportResult.path}` }),
+                jsx(CopyButton, { appearance: 'icon', text: () => exportResult.path, title: 'Copy path' }),
+                jsx(Button, {
+                  size: 'xs',
+                  variant: 'ghost',
+                  onClick: () => tryOsAction('revealPath', exportResult.path, 'Reveal in folder'),
+                  children: 'Reveal in folder',
+                }),
+                jsx(Button, {
+                  size: 'xs',
+                  variant: 'ghost',
+                  onClick: () => tryOsAction('openExternal', crFileUrl(exportResult.path), 'Open in browser'),
+                  children: 'Open in browser',
+                }),
+              ],
+        })
+      : null,
+    publishResult
+      ? jsxs('div', {
+          style: {
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '4px 8px',
+            borderBottom: '1px solid rgba(128,128,128,0.15)',
+            flexWrap: 'wrap',
+            fontSize: 11,
+          },
+          children: publishResult.errors
+            ? [
+                jsx('span', {
+                  style: { color: '#e5484d', whiteSpace: 'pre-wrap' },
+                  children: `Publish failed: ${publishResult.errors}`,
+                }),
+              ]
+            : publishResult.error === 'github_not_configured'
+            ? [
+                jsx('span', {
+                  style: { opacity: 0.7 },
+                  children: publishResult.how || 'GitHub CLI (gh) is not configured for publishing.',
+                }),
+              ]
+            : publishResult.error === 'needs_pane'
+            ? [
+                jsx('span', {
+                  style: { opacity: 0.7 },
+                  children: 'Publish needs the rendered content — try again.',
+                }),
+              ]
+            : publishResult.error
+            ? [jsx('span', { style: { color: '#e5484d' }, children: `Publish failed: ${publishResult.error}` })]
+            : [
+                jsx('span', { style: { opacity: 0.7 }, children: `Published: ${publishResult.url}` }),
+                jsx(CopyButton, { appearance: 'icon', text: () => publishResult.url, title: 'Copy URL' }),
+                jsx(Button, {
+                  size: 'xs',
+                  variant: 'ghost',
+                  onClick: () => tryOsAction('openExternal', publishResult.url, 'Open in browser'),
+                  children: 'Open in browser',
+                }),
+                // Fold-in Minor B (final review): raw_url is returned for every
+                // published type (cr_store.py's publish_artifact), but the UI never
+                // rendered it — add the same copy affordance the gist `url` gets.
+                publishResult.raw_url
+                  ? jsx('span', { style: { opacity: 0.5 }, children: 'raw:' })
+                  : null,
+                publishResult.raw_url
+                  ? jsx(CopyButton, { appearance: 'icon', text: () => publishResult.raw_url, title: 'Copy raw-render link' })
+                  : null,
+              ],
+        })
+      : null,
     ],
   })
+}
+
+// Maps an artifact's type/language (cr_store.py's VALID_TYPES / LANG_EXT,
+// task-4) to one of codemirror-entry.js's LANGS keys (javascript/html/css/
+// python/markdown, task-26). 'react' -> 'javascript': that key's javascript()
+// call is built with {jsx: true, typescript: true} unconditionally (see
+// codemirror-entry.js), so JSX highlighting comes for free without a
+// separate jsx/tsx key. 'markdown'/'mermaid' artifacts both get 'markdown'
+// highlighting (mermaid is fenced text with no dedicated CM6 mode here — a
+// reasonable approximation over no highlighting at all). 'svg' and anything
+// else unrecognized (json/sql/go/rust/bash/...) fall back to null, which
+// basicExtensions already treats as "no language extension" (task-27).
+function crCmLanguageFor(type, language) {
+  if (type === 'html') return 'html'
+  if (type === 'react') return 'javascript'
+  if (type === 'markdown' || type === 'mermaid') return 'markdown'
+  if (type === 'code') {
+    const lang = (language || '').toLowerCase()
+    if (['javascript', 'js', 'typescript', 'ts', 'jsx', 'tsx'].includes(lang)) return 'javascript'
+    if (lang === 'css') return 'css'
+    if (lang === 'python' || lang === 'py') return 'python'
+    if (lang === 'html') return 'html'
+    if (lang === 'markdown' || lang === 'md') return 'markdown'
+    return null
+  }
+  return null
 }
 
 function CrEditor() {
@@ -1826,6 +2056,7 @@ function CrEditor() {
   const baseRef = useRef(content)
   const count = (detail && detail.version_count) || 1
   const readOnly = vv != null && vv < count
+  const cmLanguage = crCmLanguageFor(detail && detail.type, detail && detail.language)
 
   useEffect(() => {
     setDraft(content)
@@ -1849,26 +2080,6 @@ function CrEditor() {
       })
       .catch((e) => host.notifyError?.(e, 'Save failed'))
       .finally(() => crBusy$.set(false))
-  }
-  const onKeyDown = (e) => {
-    if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
-      e.preventDefault()
-      save()
-      return
-    }
-    if (e.key === 'Tab' && !readOnly) {
-      e.preventDefault()
-      const el = e.target
-      const s = el.selectionStart
-      const en = el.selectionEnd
-      const next = draft.slice(0, s) + '  ' + draft.slice(en)
-      setBoth(next)
-      requestAnimationFrame(() => {
-        try {
-          el.selectionStart = el.selectionEnd = s + 2
-        } catch {}
-      })
-    }
   }
 
   return jsxs('div', {
@@ -1896,18 +2107,178 @@ function CrEditor() {
           jsx(Button, { size: 'xs', disabled: readOnly || !dirty || busy, onClick: save, children: 'Save' }),
         ],
       }),
-      jsx(Textarea, {
-        className:
-          'block w-full resize-none rounded-none border-0 bg-transparent p-2.5 font-mono text-xs leading-relaxed shadow-none focus-visible:ring-0',
-        style: { flex: 1, minHeight: 140 },
-        value: draft,
-        readOnly,
-        spellCheck: false,
-        onKeyDown,
-        onChange: (e) => setBoth(e.target.value),
+      jsx('div', {
+        style: { flex: 1, minHeight: 140, overflow: 'auto' },
+        children: jsx(CrCmEditor, {
+          value: draft,
+          language: cmLanguage,
+          readOnly,
+          onChange: setBoth,
+          onSave: save,
+        }),
       }),
     ],
   })
+}
+
+// CodeMirror 6 loader (task-27, creator-libs/codemirror.js from task-26).
+// codemirror.js is a real ESM (unlike esbuild.js's UMD build) so blob-
+// importing it yields its actual exports directly, same trick as
+// crTailwindLib. Only a SUCCESSFUL load is memoized — a transient crAsset
+// failure (network blip) clears the memo and resolves `null` for that one
+// call instead of wedging every future call behind a cached rejection/null
+// (the Phase 2 review finding this task was told to avoid repeating).
+let crCodeMirrorPromise = null
+function crCodeMirror() {
+  if (crCodeMirrorPromise) return crCodeMirrorPromise
+  crCodeMirrorPromise = (async () => {
+    const src = await crAsset('codemirror.js')
+    const blobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))
+    try {
+      return await import(blobUrl)
+    } finally {
+      URL.revokeObjectURL(blobUrl)
+    }
+  })().catch((e) => {
+    console.warn('crCodeMirror: codemirror.js failed to load, falling back to plain textarea', e)
+    crCodeMirrorPromise = null
+    return null
+  })
+  return crCodeMirrorPromise
+}
+
+// Rich editor wrapper (task-27, readOnly-toggle fixed per review). `readOnly`
+// is wrapped in its own `Compartment` (added to codemirror-entry.js's exports
+// for this fix — see that file's header) so toggling it later is a
+// `view.dispatch({effects: compartment.reconfigure(...)})`, not a full state
+// rebuild: selection/scroll/undo-history all survive untouched because the
+// rest of the config (including `history()` inside `basicExtensions`) is
+// never re-instantiated. `EditorView.updateListener`/`domEventHandlers` are
+// static members of the exported `EditorView` class, used for the
+// dirty/onChange wire and the Mod-s save shortcut (CM6's normal alternative
+// to a one-off `keymap.of(...)` entry).
+function crCmExtensions(cm, { language, dark, onChange, onSave }) {
+  return [
+    cm.basicExtensions(language, dark),
+    cm.EditorView.updateListener.of((u) => {
+      if (u.docChanged) onChange?.(u.state.doc.toString())
+    }),
+    cm.EditorView.domEventHandlers({
+      keydown(e) {
+        if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+          e.preventDefault()
+          onSave?.()
+          return true
+        }
+        return false
+      },
+    }),
+  ]
+}
+
+function CrCmEditor({ value, language, readOnly, onChange, onSave }) {
+  const hostRef = useRef(null)
+  const viewRef = useRef(null)
+  const roCompartmentRef = useRef(null)
+  const propsRef = useRef({ value, language, readOnly, onChange, onSave })
+  propsRef.current = { value, language, readOnly, onChange, onSave }
+  const [cmOk, setCmOk] = useState(null) // null = loading, false = unavailable, true = mounted
+
+  useEffect(() => {
+    let cancelled = false
+    crCodeMirror().then((cm) => {
+      if (cancelled || !hostRef.current) return
+      if (!cm) {
+        setCmOk(false)
+        return
+      }
+      const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches
+      const roCompartment = new cm.Compartment()
+      roCompartmentRef.current = roCompartment
+      viewRef.current = new cm.EditorView({
+        doc: propsRef.current.value || '',
+        // onChange/onSave read through propsRef.current AT CALL TIME instead of being
+        // destructured here — this effect only runs once on mount, so destructuring
+        // would freeze these callbacks at their mount-time closures forever (the
+        // final-review Fix 1 bug: Mod-s kept saving stale pre-edit content). language/
+        // dark are fine to freeze — they don't change per-render like onChange/onSave do.
+        extensions: [
+          ...crCmExtensions(cm, {
+            language: propsRef.current.language,
+            dark,
+            onChange: (v) => propsRef.current.onChange?.(v),
+            onSave: () => propsRef.current.onSave?.(),
+          }),
+          roCompartment.of(cm.readOnly(!!propsRef.current.readOnly)),
+        ],
+        parent: hostRef.current,
+      })
+      setCmOk(true)
+    })
+    return () => {
+      cancelled = true
+      viewRef.current?.destroy()
+      viewRef.current = null
+      roCompartmentRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    const view = viewRef.current
+    if (!view || value === view.state.doc.toString()) return
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: value || '' } })
+  }, [value])
+
+  useEffect(() => {
+    const view = viewRef.current
+    const roCompartment = roCompartmentRef.current
+    if (!view || !roCompartment) return
+    crCodeMirror().then((cm) => {
+      if (!cm || viewRef.current !== view) return
+      view.dispatch({ effects: roCompartment.reconfigure(cm.readOnly(!!readOnly)) })
+    })
+  }, [readOnly])
+
+  if (cmOk === false) {
+    return jsxs('div', {
+      style: { display: 'flex', flexDirection: 'column', height: '100%' },
+      children: [
+        jsx('div', { style: { fontSize: 11, opacity: 0.6, padding: '2px 4px' }, children: 'Rich editor unavailable — plain text editor' }),
+        jsx(Textarea, {
+          className: 'block w-full resize-none rounded-none border-0 bg-transparent p-2.5 font-mono text-xs leading-relaxed shadow-none focus-visible:ring-0',
+          style: { flex: 1, minHeight: 140 },
+          value,
+          readOnly: !!readOnly,
+          spellCheck: false,
+          onChange: (e) => onChange?.(e.target.value),
+          onKeyDown: (e) => {
+            if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+              e.preventDefault()
+              onSave?.()
+              return
+            }
+            // Tab-to-indent restored for the plain-textarea fallback (the pre-Task-28
+            // Textarea editor had this; CM6's basicExtensions keymap covers the rich
+            // editor path — see codemirror-entry.js's indentWithTab).
+            if (e.key === 'Tab' && !readOnly) {
+              e.preventDefault()
+              const el = e.target
+              const s = el.selectionStart
+              const en = el.selectionEnd
+              const next = (value || '').slice(0, s) + '  ' + (value || '').slice(en)
+              onChange?.(next)
+              requestAnimationFrame(() => {
+                try {
+                  el.selectionStart = el.selectionEnd = s + 2
+                } catch {}
+              })
+            }
+          },
+        }),
+      ],
+    })
+  }
+  return jsx('div', { ref: hostRef, className: 'cr-cm-editor', style: { height: '100%' } })
 }
 
 // React artifact preview iframe (spec §6.3). `bundle`/`css`/`nonce`/

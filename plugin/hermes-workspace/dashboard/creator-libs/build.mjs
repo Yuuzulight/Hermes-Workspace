@@ -36,6 +36,18 @@ const LIBS = [
   // (see that file's header, and task-20-report.md, for why). The `.css`
   // loader lets it import tailwindcss's theme.css as an inlined text string.
   { specifier: 'tailwind', entryPoint: './tailwind-entry.js', outfile: './tailwind.js', loader: { '.css': 'text' } },
+  // Facade over @codemirror/{state,view,commands,language,search,autocomplete}
+  // + lang-{javascript,html,css,python,markdown} + the one-dark theme (see
+  // ./codemirror-entry.js header). No React dependency, so nothing external.
+  { specifier: 'codemirror', entryPoint: './codemirror-entry.js', outfile: './codemirror.js' },
+  // Facade over `marked` / `mermaid`, split into two bundles (final-review
+  // Fix 4 — see ./viewer-md-entry.js and ./viewer-mermaid-entry.js headers)
+  // so a markdown export only pays for `marked`, not the ~3.5MB `mermaid`
+  // bundle it never invokes. Each is inlined verbatim into its matching
+  // Task 29 `.html` export so it renders fully offline. No React
+  // dependency, so nothing external.
+  { specifier: 'viewer-md', entryPoint: './viewer-md-entry.js', outfile: './viewer-md.js' },
+  { specifier: 'viewer-mermaid', entryPoint: './viewer-mermaid-entry.js', outfile: './viewer-mermaid.js' },
 ]
 
 const here = (p) => new URL(p, import.meta.url)

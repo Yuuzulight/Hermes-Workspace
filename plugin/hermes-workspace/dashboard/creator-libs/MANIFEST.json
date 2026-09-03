@@ -100,5 +100,17 @@
   "tailwind": {
     "file": "tailwind.js",
     "subdeps": []
+  },
+  "codemirror": {
+    "file": "codemirror.js",
+    "subdeps": []
+  },
+  "viewer-md": {
+    "file": "viewer-md.js",
+    "subdeps": []
+  },
+  "viewer-mermaid": {
+    "file": "viewer-mermaid.js",
+    "subdeps": []
   }
 }

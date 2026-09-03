@@ -43,8 +43,25 @@ Tailwind build, ~19 MB committed to the repo (not gitignored; only
 `creator-libs/node_modules/` is). It's rebuilt with
 `node plugin/hermes-workspace/dashboard/creator-libs/build.mjs` and checked
 with `node plugin/hermes-workspace/dashboard/creator-libs/verify.mjs` — see
-Development below. Still Phase 2: CodeMirror editing, standalone export, and
-Gist publish land in Phase 3.
+Development below.
+
+**Editor** — the pane edits artifacts with a real CodeMirror 6 (syntax
+highlighting per type/language, search, bracket matching). If the vendored
+CodeMirror asset fails to load, editing falls back to the plain Phase 1
+`Textarea` instead of breaking.
+
+**Export** — the "Export" button writes the current artifact out as a
+standalone, portable `.html` file (`react` artifacts get their bundle +
+compiled Tailwind CSS inlined, no compiler or preview-bridge code in the
+output). The exported file works fully offline — open it directly in any
+browser, no server involved.
+
+**Publish** — the "Publish" button posts the same standalone HTML to a
+public GitHub Gist via the `gh` CLI and returns a shareable URL; a raw-render
+link is also returned for every published type. `gh` is **optional**: if it isn't
+installed and authenticated, Publish doesn't fail silently — it shows a
+notice explaining how to enable it (`install gh and run gh auth login, or
+set a token in Creator settings`).
 
 ## Requirements
 
@@ -167,3 +184,22 @@ Phase 2 (`type=react`), per design-creator.md §9.2:
   keystroke).
 - Stepping the version stepper to an already-seen version is instant — served
   from the bundle/Tailwind cache, not rebuilt.
+
+Phase 3 (CodeMirror editor, export, publish), per design-creator.md §9.2 —
+**not run as part of this change; walk it after any Creator change**:
+
+- The CodeMirror editor loads and highlights correctly for each artifact
+  type/language; forcing the CodeMirror asset load to fail falls back to the
+  Phase 1 `Textarea` instead of breaking editing.
+- Edit + Save still works through the new editor (new version created, dirty
+  dot behaves, ⌘S works, read-only on a non-latest version).
+- Exporting each artifact type produces a valid standalone `.html` file that
+  opens correctly in a real browser with no server running.
+- The `react` export specifically: no console errors on open, and no
+  orphaned bridge/`postMessage` code in the output (it's a real standalone
+  doc, not a leftover preview iframe payload) — and it's styled (the
+  compiled Tailwind CSS is inlined, not missing).
+- Publish, with `gh` installed and authenticated, returns a working Gist URL
+  that opens the published artifact.
+- Publish, without `gh` configured, shows the "how to enable" notice instead
+  of failing silently or throwing.

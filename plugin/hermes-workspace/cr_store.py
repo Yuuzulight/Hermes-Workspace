@@ -1,5 +1,5 @@
 """Creator store — all Creator behaviour. stdlib only; no relative imports."""
-import base64, difflib, hashlib, json, os, re, shutil, sqlite3, time
+import base64, difflib, hashlib, html, json, os, re, shutil, sqlite3, subprocess, tempfile, time
 from pathlib import Path
 
 
@@ -589,6 +589,218 @@ def set_config(patch: dict) -> dict:
     return get_config()
 
 
+# ── Standalone .html export (§7.2) ────────────────────────────────────────────
+
+_CREATOR_LIBS_DIR = Path(__file__).resolve().parent / "dashboard" / "creator-libs"
+# Final-review Fix 4: viewer.js (marked + mermaid combined, ~3.5MB) was inlined
+# into EVERY markdown/mermaid export even though renderMarkdown never invokes
+# mermaid — split into a small marked-only bundle for markdown and a
+# mermaid-only bundle for mermaid, so a markdown export (and a Publish upload
+# of one) no longer pays for the diagram renderer it never uses.
+_VIEWER_JS_PATH = {
+    "markdown": _CREATOR_LIBS_DIR / "viewer-md.js",
+    "mermaid": _CREATOR_LIBS_DIR / "viewer-mermaid.js",
+}
+
+
+def _validate_export_dest(dest: str) -> Path:
+    """Sanity-check a caller-supplied export path. `dest` writes OUTSIDE the
+    creator store to wherever the pane assembled it (e.g. a save-dialog path),
+    so there's no "stay inside the store" invariant to enforce the way
+    delete_artifact/sanitize_identifier do for artifact-content paths — this is
+    deliberately looser. What IS enforced, mirroring set_config's project_root
+    check on the same file: `dest` must be an absolute path (no relative-to-cwd
+    ambiguity from an HTTP body) and its parent directory must already exist
+    (refuses to fabricate an arbitrary directory tree from a malformed
+    request); `dest` itself must not already be a directory."""
+    if not dest or not isinstance(dest, str):
+        raise StoreBadInput("dest must be a non-empty path")
+    p = Path(dest)
+    if not p.is_absolute():
+        raise StoreBadInput("dest must be an absolute path")
+    if p.is_dir():
+        raise StoreBadInput("dest must be a file path, not a directory")
+    if not p.parent.is_dir():
+        raise StoreBadInput("dest's parent directory does not exist")
+    return p
+
+
+def _export_dest(identifier: str, dest: str | None) -> Path:
+    """Resolve the write path for an export: `dest` if given (validated), else
+    `_creator_dir()/exports/<dir>-v<N>.html` (dir created if missing)."""
+    row = _meta(identifier)
+    if row is None:
+        raise StoreNotFound(f"no artifact '{identifier}' — call create_artifact first")
+    dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
+    if dest:
+        return _validate_export_dest(dest)
+    exports = _creator_dir() / "exports"
+    exports.mkdir(parents=True, exist_ok=True)
+    return exports / f"{dir_}-v{maxn}.html"
+
+
+def _write_export(path: Path, data: bytes) -> None:
+    """Atomic write for an export file (tmp + os.replace), same pattern as
+    set_config. No fsync: an export file isn't the source of truth the way an
+    artifact version is — a crash mid-write just means re-exporting."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def _minimal_doc(title: str, body: str) -> str:
+    """A minimal self-contained HTML document wrapping `body` (already HTML)."""
+    return (
+        '<!doctype html>\n<html><head><meta charset="utf-8">'
+        f"<title>{html.escape(title or 'artifact')}</title></head>\n"
+        f"<body>{body}</body></html>\n"
+    )
+
+
+def _embed_js_string(s: str) -> str:
+    """JSON-encode `s` for embedding in an inline <script> — escape "</" so a
+    literal "</script" inside the payload can't close the tag early."""
+    return json.dumps(s).replace("</", "<\\/")
+
+
+def _viewer_doc(title: str, type_: str, source: str) -> str:
+    """markdown/mermaid export: embed the raw source + the vendored viewer
+    bundle matching `type_` (Task 29 — marked for markdown, mermaid for
+    mermaid; split per final-review Fix 4 so a markdown export doesn't carry
+    the mermaid renderer it never calls) inlined verbatim, loaded via the same
+    blob-module `import(URL.createObjectURL(...))` mechanism the desktop
+    plugin already uses to load codemirror.js (design-creator.md §7.1) — fully
+    offline, no server, no network fetch of the bundle at export time."""
+    viewer_code = _VIEWER_JS_PATH[type_].read_text(encoding="utf-8")
+    # Each split bundle exports exactly one relevant function now (Fix 4), so
+    # the bootstrap calls it directly instead of branching on both — a
+    # markdown export's inlined text must not even mention renderMermaidInto,
+    # or the split buys nothing but bundle size.
+    render_call = (
+        "root.innerHTML = mod.renderMarkdown(window.__CR_SRC__);"
+        if type_ == "markdown"
+        else "return mod.renderMermaidInto(root, window.__CR_SRC__);"
+    )
+    body = (
+        '<div id="root">Loading…</div>\n'
+        f"<script>window.__CR_SRC__={_embed_js_string(source)};"
+        f"window.__CR_VIEWER__={_embed_js_string(viewer_code)};</script>\n"
+        "<script>(function(){"
+        "var blobUrl = URL.createObjectURL(new Blob([window.__CR_VIEWER__], {type: 'text/javascript'}));"
+        "import(blobUrl).then(function(mod){"
+        "var root = document.getElementById('root');"
+        f"{render_call}"
+        "}).catch(function(err){"
+        "document.getElementById('root').textContent = 'render failed: ' + err;"
+        "});"
+        "})();</script>\n"
+    )
+    return _minimal_doc(title, body)
+
+
+def export_artifact(identifier: str, dest: str | None = None) -> str:
+    """Standalone `.html` export (§7.2). `react` is assembled client-side in the
+    pane (esbuild bundle + the renderer's already-computed Tailwind CSS) — not
+    reproducible here, so it raises. Returns the written file's absolute path."""
+    row = _meta(identifier)
+    if row is None:
+        raise StoreNotFound(f"no artifact '{identifier}' — call create_artifact first")
+    dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
+    if type_ == "react":
+        raise StoreBadInput("react export is assembled in the pane")
+    content = get_version(identifier, maxn)["content"]
+
+    # code + dest ending in the artifact's own extension -> raw file, no wrap.
+    if type_ == "code" and dest and dest.endswith("." + maxn_ext):
+        path = _validate_export_dest(dest)
+        _write_export(path, content.encode("utf-8"))
+        return str(path)
+
+    if type_ == "html":
+        doc = content if re.search(r"<html[\s>]", content, re.I) else _minimal_doc(title, content)
+    elif type_ == "svg":
+        doc = _minimal_doc(title, content)
+    elif type_ == "code":
+        doc = _minimal_doc(title, f"<pre>{html.escape(content)}</pre>")
+    elif type_ in ("markdown", "mermaid"):
+        doc = _viewer_doc(title, type_, content)
+    else:
+        raise StoreBadInput(f"cannot export type '{type_}'")
+
+    return write_export_bundle(identifier, doc, dest)
+
+
+def write_export_bundle(identifier: str, html: str, dest: str | None = None) -> str:
+    """Persist a pane-assembled export (the `react` path: the renderer already
+    built the full HTML string). Same destination resolution as
+    export_artifact — `dest` if given, else `exports/<dir>-v<N>.html`."""
+    path = _export_dest(identifier, dest)
+    _write_export(path, html.encode("utf-8"))
+    return str(path)
+
+
+# ── Publish to Gist (§7.3, pane button only — no agent tool) ─────────────────
+
+_GIST_URL_RE = re.compile(r"^https://gist\.github\.com/([^/\s]+)/([0-9a-f]+)/?$")
+
+
+def publish_artifact(identifier: str, html: str | None = None) -> dict:
+    """Publish the artifact's standalone HTML (reusing export_artifact's
+    per-type assembly — `react` supplies its pane-built `html` directly, same
+    contract as write_export_bundle) to a public GitHub gist via the `gh` CLI.
+    Never raises for an expected/recoverable condition — returns {"error": ...}
+    instead; only StoreNotFound (unknown identifier) propagates."""
+    row = _meta(identifier)
+    if row is None:
+        raise StoreNotFound(f"no artifact '{identifier}' — call create_artifact first")
+    dir_, type_, title, language, updated_at, vcount, maxn, maxn_ext = row
+
+    if type_ == "react":
+        if not html:
+            return {"error": "needs_pane"}
+        doc = html
+    else:
+        doc = Path(export_artifact(identifier)).read_text(encoding="utf-8")
+
+    if not shutil.which("gh"):
+        return {"error": "github_not_configured",
+                "how": "install gh and run gh auth login, or set a token in Creator settings"}
+    auth = subprocess.run(["gh", "auth", "status"], capture_output=True)
+    if auth.returncode != 0:
+        return {"error": "github_not_configured",
+                "how": "install gh and run gh auth login, or set a token in Creator settings"}
+
+    # TODO(later): creator.github_token REST-API publish path (gh CLI unavailable case)
+    filename = f"{sanitize_identifier(title or identifier)}.html"
+    tmp_dir = tempfile.mkdtemp(prefix="cr-publish-")
+    try:
+        file_path = Path(tmp_dir) / filename
+        file_path.write_text(doc, encoding="utf-8")
+        r = subprocess.run(
+            ["gh", "gist", "create", "--public", str(file_path), "--desc", title or identifier],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            return {"error": "gist_create_failed", "detail": (r.stderr or r.stdout).strip()}
+        lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+        url = lines[-1] if lines else ""
+        m = _GIST_URL_RE.match(url)
+        if not m:
+            return {"error": "gist_create_failed",
+                    "detail": f"could not parse gist URL from gh output: {url!r}"}
+        user, gist_id = m.group(1), m.group(2)
+        # githack.com serves gist raw content with the right content-type so an
+        # .html gist actually renders instead of downloading — see raw.githack.com.
+        raw_url = f"https://raw.githack.com/{user}/{gist_id}/raw/{filename}"
+        return {"url": url, "raw_url": raw_url}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ── Transcript scan (§5.9) ────────────────────────────────────────────────────
 
 NON_ARTIFACT_LANGS = frozenset({
@@ -983,6 +1195,52 @@ def _selfcheck() -> None:
             assert do_read({"identifier": "app"})["content"] == "export default () => null"
             dir_ = _meta("app")[0]
             assert (_creator_dir() / dir_ / "v1.jsx").is_file()
+    finally:
+        if saved is None: os.environ.pop("HERMES_HOME", None)
+        else: os.environ["HERMES_HOME"] = saved
+
+    # Task 31: publish_artifact — Publish to Gist. Monkeypatches shutil.which +
+    # subprocess.run so this NEVER shells out to the real `gh` CLI (which is
+    # installed and authenticated in some environments and would publish a
+    # real public gist).
+    saved = os.environ.get("HERMES_HOME")
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            os.environ["HERMES_HOME"] = os.path.join(d, "home")
+            do_create({"identifier": "pub-doc", "type": "markdown", "title": "Pub Doc",
+                      "content": "# hello"}, "s1")
+            do_create({"identifier": "pub-app", "type": "react", "title": "Pub App",
+                      "content": "export default () => null"}, "s1")
+
+            orig_which, orig_run = shutil.which, subprocess.run
+
+            def fake_run(args, **kw):
+                if args[:2] == ["gh", "auth"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args[:3] == ["gh", "gist", "create"]:
+                    return subprocess.CompletedProcess(
+                        args, 0, "https://gist.github.com/testuser/abc123ef0102\n", "")
+                raise AssertionError(f"unexpected subprocess.run in selfcheck: {args}")
+
+            shutil.which = lambda name: "/usr/bin/gh" if name == "gh" else None
+            subprocess.run = fake_run
+            try:
+                r = publish_artifact("pub-doc")
+                assert r == {"url": "https://gist.github.com/testuser/abc123ef0102",
+                            "raw_url": "https://raw.githack.com/testuser/abc123ef0102/raw/pub-doc.html"}, r
+                assert publish_artifact("pub-app") == {"error": "needs_pane"}
+                r2 = publish_artifact("pub-app", html="<html><body>x</body></html>")
+                assert r2["url"] == "https://gist.github.com/testuser/abc123ef0102"
+            finally:
+                shutil.which, subprocess.run = orig_which, orig_run
+
+            shutil.which = lambda name: None
+            try:
+                assert publish_artifact("pub-doc") == {
+                    "error": "github_not_configured",
+                    "how": "install gh and run gh auth login, or set a token in Creator settings"}
+            finally:
+                shutil.which = orig_which
     finally:
         if saved is None: os.environ.pop("HERMES_HOME", None)
         else: os.environ["HERMES_HOME"] = saved
