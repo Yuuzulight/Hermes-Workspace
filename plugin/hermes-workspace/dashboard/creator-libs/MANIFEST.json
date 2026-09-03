@@ -105,8 +105,12 @@
     "file": "codemirror.js",
     "subdeps": []
   },
-  "viewer": {
-    "file": "viewer.js",
+  "viewer-md": {
+    "file": "viewer-md.js",
+    "subdeps": []
+  },
+  "viewer-mermaid": {
+    "file": "viewer-mermaid.js",
     "subdeps": []
   }
 }

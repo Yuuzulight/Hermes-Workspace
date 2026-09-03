@@ -591,7 +591,16 @@ def set_config(patch: dict) -> dict:
 
 # ── Standalone .html export (§7.2) ────────────────────────────────────────────
 
-_VIEWER_JS_PATH = Path(__file__).resolve().parent / "dashboard" / "creator-libs" / "viewer.js"
+_CREATOR_LIBS_DIR = Path(__file__).resolve().parent / "dashboard" / "creator-libs"
+# Final-review Fix 4: viewer.js (marked + mermaid combined, ~3.5MB) was inlined
+# into EVERY markdown/mermaid export even though renderMarkdown never invokes
+# mermaid — split into a small marked-only bundle for markdown and a
+# mermaid-only bundle for mermaid, so a markdown export (and a Publish upload
+# of one) no longer pays for the diagram renderer it never uses.
+_VIEWER_JS_PATH = {
+    "markdown": _CREATOR_LIBS_DIR / "viewer-md.js",
+    "mermaid": _CREATOR_LIBS_DIR / "viewer-mermaid.js",
+}
 
 
 def _validate_export_dest(dest: str) -> Path:
@@ -660,13 +669,23 @@ def _embed_js_string(s: str) -> str:
 
 
 def _viewer_doc(title: str, type_: str, source: str) -> str:
-    """markdown/mermaid export: embed the raw source + the vendored viewer.js
-    bundle (Task 29 — marked + mermaid) inlined verbatim, loaded via the same
+    """markdown/mermaid export: embed the raw source + the vendored viewer
+    bundle matching `type_` (Task 29 — marked for markdown, mermaid for
+    mermaid; split per final-review Fix 4 so a markdown export doesn't carry
+    the mermaid renderer it never calls) inlined verbatim, loaded via the same
     blob-module `import(URL.createObjectURL(...))` mechanism the desktop
     plugin already uses to load codemirror.js (design-creator.md §7.1) — fully
-    offline, no server, no network fetch of viewer.js at export time."""
-    viewer_code = _VIEWER_JS_PATH.read_text(encoding="utf-8")
-    is_markdown = "true" if type_ == "markdown" else "false"
+    offline, no server, no network fetch of the bundle at export time."""
+    viewer_code = _VIEWER_JS_PATH[type_].read_text(encoding="utf-8")
+    # Each split bundle exports exactly one relevant function now (Fix 4), so
+    # the bootstrap calls it directly instead of branching on both — a
+    # markdown export's inlined text must not even mention renderMermaidInto,
+    # or the split buys nothing but bundle size.
+    render_call = (
+        "root.innerHTML = mod.renderMarkdown(window.__CR_SRC__);"
+        if type_ == "markdown"
+        else "return mod.renderMermaidInto(root, window.__CR_SRC__);"
+    )
     body = (
         '<div id="root">Loading…</div>\n'
         f"<script>window.__CR_SRC__={_embed_js_string(source)};"
@@ -675,8 +694,7 @@ def _viewer_doc(title: str, type_: str, source: str) -> str:
         "var blobUrl = URL.createObjectURL(new Blob([window.__CR_VIEWER__], {type: 'text/javascript'}));"
         "import(blobUrl).then(function(mod){"
         "var root = document.getElementById('root');"
-        f"if ({is_markdown}) {{ root.innerHTML = mod.renderMarkdown(window.__CR_SRC__); }}"
-        "else { return mod.renderMermaidInto(root, window.__CR_SRC__); }"
+        f"{render_call}"
         "}).catch(function(err){"
         "document.getElementById('root').textContent = 'render failed: ' + err;"
         "});"

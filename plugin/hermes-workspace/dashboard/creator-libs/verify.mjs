@@ -25,7 +25,7 @@ if (wasm[0] !== 0x00 || wasm[1] !== 0x61) throw new Error('bad wasm magic')
 
 const need = ['react','react-dom','recharts','lucide-react','d3','three','@react-three/fiber',
   'papaparse','xlsx','mathjs','tone','@tanstack/react-table','lodash','date-fns',
-  'framer-motion','clsx','tailwind-merge','class-variance-authority','tailwind','codemirror','viewer']
+  'framer-motion','clsx','tailwind-merge','class-variance-authority','tailwind','codemirror','viewer-md','viewer-mermaid']
 for (const s of need) if (!man[s]) throw new Error(`MANIFEST missing ${s}`)
 
 console.log('verify ok')

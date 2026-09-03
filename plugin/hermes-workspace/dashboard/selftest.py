@@ -380,9 +380,11 @@ def _selfcheck_creator_http() -> None:
 def _selfcheck_creator_export() -> None:
     """Task 29: standalone `.html` export — html/svg/code/markdown each produce
     a non-empty file on disk containing the artifact's content; markdown's file
-    also carries the inlined viewer.js bundle (the `renderMarkdown` call the
-    bootstrap script makes into it, plus its multi-MB bulk); `react` export
-    returns 400 (assembled client-side in the pane, not reproducible server-side)."""
+    also carries the inlined marked-only viewer-md.js bundle (the
+    `renderMarkdown` call the bootstrap script makes into it) but, per
+    final-review Fix 4, NOT the ~3.5MB mermaid renderer it never calls — so the
+    file stays small; `react` export returns 400 (assembled client-side in the
+    pane, not reproducible server-side)."""
     import tempfile
     saved = os.environ.get("HERMES_HOME")
     try:
@@ -416,11 +418,15 @@ def _selfcheck_creator_export() -> None:
                 assert content in text, (ident, content, text[:200])
                 paths[ident] = text
 
-            # markdown export carries the inlined viewer.js bundle: the bootstrap
-            # script literally calls mod.renderMarkdown(...), and the bundle
-            # itself (marked + mermaid) is multi-MB, so a small file rules it out.
+            # markdown export carries the inlined viewer-md.js bundle: the
+            # bootstrap script literally calls mod.renderMarkdown(...). Final-
+            # review Fix 4 split marked out of the combined marked+mermaid
+            # viewer.js, so a markdown export must NOT drag in the mermaid
+            # renderer it never calls, and the file must stay well under the
+            # old combined bundle's multi-MB size.
             assert "renderMarkdown" in paths["exp-md"]
-            assert len(paths["exp-md"]) > 500_000, len(paths["exp-md"])
+            assert "renderMermaidInto" not in paths["exp-md"]
+            assert len(paths["exp-md"]) < 500_000, len(paths["exp-md"])
 
             # react: not reproducible server-side -> 400
             cr_api.cr_store.do_create(
